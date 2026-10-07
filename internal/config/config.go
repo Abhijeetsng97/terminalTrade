@@ -40,6 +40,18 @@ type Config struct {
 	// Trading
 	Underlyings []string // chain underlyings to preload (NIFTY, BANKNIFTY)
 
+	// Local testing: SIM mode wires two simulated brokers with a
+	// synthetic quote feed — no real credentials, no money.
+	Sim bool
+
+	// Force open ignores market hours (sim/dev only; the engine and
+	// guard still log when it is active).
+	ForceOpen bool
+
+	// SimAlwaysOpen: in sim mode the market is treated as always
+	// open so orders can be tested at any hour. Default true.
+	SimAlwaysOpen bool
+
 	// Ops
 	InstrumentRefreshCron string // cron spec for background refresh
 }
@@ -75,6 +87,10 @@ func Load() (*Config, error) {
 	for i := range c.Underlyings {
 		c.Underlyings[i] = strings.TrimSpace(strings.ToUpper(c.Underlyings[i]))
 	}
+
+	c.Sim = envBool("TT_SIM", false)
+	c.ForceOpen = envBool("TT_FORCE_OPEN", false)
+	c.SimAlwaysOpen = envBool("TT_SIM_ALWAYS_OPEN", true)
 
 	keyHex := envStr("TT_ENCRYPTION_KEY", "")
 	if keyHex == "" {
@@ -135,4 +151,18 @@ func envInt(key string, def int) int {
 		return def
 	}
 	return n
+}
+
+func envBool(key string, def bool) bool {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	switch v {
+	case "1", "true", "TRUE", "yes", "on":
+		return true
+	case "0", "false", "FALSE", "no", "off":
+		return false
+	}
+	return def
 }

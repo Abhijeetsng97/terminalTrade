@@ -1,14 +1,25 @@
 // Package sshserver serves the TUI over SSH with pubkey auth and the
 // TOTP gate: `ssh trade.tradeapp.in` -> terminal.
+//
+// Built on wish's official middleware chain: activeterm (rejects
+// non-PTY clients) + bubbletea (PTY allocation, window-size
+// forwarding, renderer setup) — which is what makes the TUI actually
+// render over SSH. The TOTP gate is a custom middleware that runs
+// before the bubbletea middleware.
 package sshserver
 
 import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/log"
-	"github.com/gliderlabs/ssh"
+	"github.com/charmbracelet/ssh"
+	"github.com/charmbracelet/wish"
+	"github.com/charmbracelet/wish/activeterm"
+	bubbleteamw "github.com/charmbracelet/wish/bubbletea"
 	gossh "golang.org/x/crypto/ssh"
 
 	"github.com/Abhijeetsng97/terminalTrade/internal/app"
@@ -16,83 +27,105 @@ import (
 	tuiapp "github.com/Abhijeetsng97/terminalTrade/internal/tui"
 )
 
-// Server wraps the wish SSH server.
-type Server struct {
-	App  *app.App
-	Gate *auth.Gate
-	Addr string
-	srv  *ssh.Server
+// ErrNoAuthorizedKeys is returned when no authorized keys are
+// configured (fail closed).
+var ErrNoAuthorizedKeys = errors.New("no authorized keys configured")
 
-	authorizedKeys []string
-}
-
-// SetAuthorizedKeys loads the authorized-keys allowlist (one line
-// per key). Call before ListenAndServe; empty list = deny all.
+// SetAuthorizedKeys loads the public-key allowlist (one line per
+// key, standard authorized_keys format). Call before
+// ListenAndServe; empty list = deny all.
 func (s *Server) SetAuthorizedKeys(lines []string) {
 	s.authorizedKeys = lines
 }
 
-func New(a *app.App, gate *auth.Gate, port int) *Server {
-	s := &Server{App: a, Gate: gate, Addr: fmt.Sprintf(":%d", port)}
-
-	s.srv = &ssh.Server{
-		Addr: s.Addr,
-		// Public key auth: the deployment's authorized keys.
-		PublicKeyHandler: func(ctx ssh.Context, key ssh.PublicKey) bool {
-			// v1: accept any key that's in the server's authorized
-			// keys file; a fixed single-user allowlist configured via
-			// deployment (TT_AUTHORIZED_KEYS path, one per line).
-			return s.authorized(key)
-		},
-		Handler: s.handle,
-	}
-	return s
+// Server wraps the wish-built SSH server. Pubkey allowlisting is
+// checked at auth time from authorizedKeys (set via SetAuthorizedKeys
+// before ListenAndServe; empty = deny all).
+type Server struct {
+	App            *app.App
+	Gate           *auth.Gate
+	Addr           string
+	srv            *ssh.Server
+	authorizedKeys []string
 }
 
-// authorized checks the key against the authorized keys file.
-func (s *Server) authorized(key ssh.PublicKey) bool {
-	// TT_AUTHORIZED_KEYS handled at config load; a missing file
-	// denies all (fail closed) — set the env var.
+func New(a *app.App, gate *auth.Gate, addr, hostKeyPath string) (*Server, error) {
+	s := &Server{App: a, Gate: gate, Addr: addr}
+
+	srv, err := wish.NewServer(
+		wish.WithAddress(addr),
+		wish.WithHostKeyPath(hostKeyPath),
+		wish.WithPublicKeyAuth(s.pubKeyHandler),
+		wish.WithMiddleware(
+			s.totpGateMW(),
+			activeterm.Middleware(),
+			bubbleteamw.Middleware(func(sess ssh.Session) (tea.Model, []tea.ProgramOption) {
+				m := tuiapp.New(a)
+				// MakeOptions wires input/output/renderer; AltScreen
+				// makes the TUI take over the full terminal.
+				opts := append(bubbleteamw.MakeOptions(sess), tea.WithAltScreen())
+				return m, opts
+			}),
+		),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("build ssh server: %w", err)
+	}
+	s.srv = srv
+	return s, nil
+}
+
+// pubKeyHandler is the SSH pubkey check against the allowlist
+// (type + base64 compared; comments ignored). Empty allowlist = deny
+// all — fail closed.
+func (s *Server) pubKeyHandler(ctx ssh.Context, key ssh.PublicKey) bool {
 	if len(s.authorizedKeys) == 0 {
 		return false
 	}
 	wanted := strings.TrimSpace(string(gossh.MarshalAuthorizedKey(key)))
-	for _, k := range s.authorizedKeys {
-		if strings.TrimSpace(k) == wanted {
+	wf := strings.Fields(wanted)
+	if len(wf) >= 2 {
+		wanted = wf[0] + " " + wf[1]
+	}
+	for _, line := range s.authorizedKeys {
+		fields := strings.Fields(strings.TrimSpace(line))
+		if len(fields) < 2 {
+			continue
+		}
+		if fields[0]+" "+fields[1] == wanted {
 			return true
 		}
 	}
 	return false
 }
 
-// Start begins listening (blocking).
-func (s *Server) ListenAndServe() error {
-	return s.srv.ListenAndServe()
-}
-
-// handle runs the TOTP gate then the TUI.
-func (s *Server) handle(sess ssh.Session) {
-	// TOTP gate: 3 strikes -> disconnect
-	gs := auth.NewGateSession(s.Gate)
-
-	if !s.gatePrompt(sess, gs) {
-		_ = sess.Close()
-		return
-	}
-
-	// run the TUI bound to this session
-	p := tuiapp.NewProgram(s.App, sess, sess)
-	if _, err := p.Run(); err != nil {
-		log.Error("tui exited", "err", err)
+// totpGateMW runs the TOTP challenge before any TUI middleware.
+func (s *Server) totpGateMW() wish.Middleware {
+	return func(next ssh.Handler) ssh.Handler {
+		return func(sess ssh.Session) {
+			gs := auth.NewGateSession(s.Gate)
+			if !runGatePrompt(sess, gs) {
+				_ = sess.CloseWrite() // let the client drain, then it exits
+				_ = sess.Close()
+				return
+			}
+			// screen reset before the TUI takes over
+			_, _ = fmt.Fprint(sess, "\x1b[2J\x1b[3J\x1b[H")
+			next(sess)
+		}
 	}
 }
 
-// gatePrompt renders the TOTP prompt over the SSH session.
-func (s *Server) gatePrompt(sess ssh.Session, gs *auth.GateSession) bool {
-	render := func(msg string) {
-		_, _ = sess.Write([]byte("\x1b[2J\x1b[H" + msg))
+// runGatePrompt asks for the 6-digit code; three wrong attempts
+// disconnect (spec: brute force impractical).
+func runGatePrompt(sess ssh.Session, gs *auth.GateSession) bool {
+	prompt := func(masked string) {
+		attempts := 3 - gs.Attempts()
+		_, _ = fmt.Fprintf(sess, "\x1b[2J\x1b[HterminalTrade\r\n\r\nEnter TOTP code (6 digits) — %d attempt(s) left:\r\n> %s",
+			attempts, masked)
 	}
-	render("terminalTrade\n\nEnter TOTP code (6 digits), 3 attempts:\n> ")
+	prompt("")
+
 	buf := make([]byte, 64)
 	var code []byte
 	for {
@@ -102,47 +135,42 @@ func (s *Server) gatePrompt(sess ssh.Session, gs *auth.GateSession) bool {
 		}
 		for _, b := range buf[:n] {
 			switch {
-			case b >= '0' && b <= '9':
+			case b >= '0' && b <= '9' && len(code) < 6:
 				code = append(code, b)
+				prompt(strings.Repeat("*", len(code)))
 				if len(code) == 6 {
 					ok, allowed := gs.Attempt(string(code))
 					if ok {
 						return true
 					}
 					if !allowed {
-						render("\nToo many attempts. Disconnecting.\n")
+						_, _ = fmt.Fprint(sess, "\r\nToo many attempts. Disconnecting.\r\n")
 						return false
 					}
-					render(fmt.Sprintf("\nWrong code. %d attempts left.\n> ", 3-gs.Attempts()))
 					code = code[:0]
-				} else {
-					render("terminalTrade\n\nEnter TOTP code (6 digits):\n> " + string(code))
+					// brief pause so the failure is visible
+					_, _ = fmt.Fprint(sess, "\r\nWrong code.\r\n")
+					time.Sleep(700 * time.Millisecond)
+					prompt("")
 				}
 			case b == 3, b == 4: // Ctrl+C / Ctrl+D
 				return false
-			case b == 13, b == 10:
-				if len(code) == 6 {
-					ok, allowed := gs.Attempt(string(code))
-					if ok {
-						return true
-					}
-					if !allowed {
-						render("\nToo many attempts. Disconnecting.\n")
-						return false
-					}
-					render(fmt.Sprintf("\nWrong code. %d attempts left.\n> ", 3-gs.Attempts()))
-					code = code[:0]
-				}
 			case b == 127, b == 8: // backspace
 				if len(code) > 0 {
 					code = code[:len(code)-1]
-					render("terminalTrade\n\nEnter TOTP code (6 digits):\n> " + string(code))
+					prompt(strings.Repeat("*", len(code)))
 				}
 			}
 		}
 	}
 }
 
-// ErrNoAuthorizedKeys is returned when the authorized-keys file is
-// missing (fail closed).
-var ErrNoAuthorizedKeys = errors.New("no authorized keys configured")
+// Start begins listening (blocking).
+func (s *Server) ListenAndServe() error {
+	return s.srv.ListenAndServe()
+}
+
+// Close shuts the server down.
+func (s *Server) Close() error { return s.srv.Close() }
+
+var _ = log.Info

@@ -67,7 +67,10 @@ func main() {
 	}()
 
 	// SSH server (the terminal)
-	sshSrv := sshserver.New(a, gate, cfg.SSHPort)
+	sshSrv, err := sshserver.New(a, gate, fmt.Sprintf(":%d", cfg.SSHPort), cfg.SSHHostKey)
+	if err != nil {
+		log.Fatal("ssh", "err", err)
+	}
 	if keys := loadAuthorizedKeys(); len(keys) > 0 {
 		sshSrv.SetAuthorizedKeys(keys)
 		log.Info("ssh authorized keys loaded", "count", len(keys))

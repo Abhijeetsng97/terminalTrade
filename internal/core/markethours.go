@@ -1,6 +1,9 @@
 package core
 
-import "time"
+import (
+	"sync"
+	"time"
+)
 
 // MarketHours enforces the 09:15–15:30 IST trading window and the
 // holiday calendar. Client-side guard: orders outside the window are
@@ -9,6 +12,10 @@ type MarketHours struct {
 	// Holidays are closed dates (IST, midnight-aligned), loaded by
 	// the instruments/ops refresh pipeline.
 	Holidays map[string]bool
+
+	// forceOpen ignores hours (sim/dev only).
+	forceOpen bool
+	mu        sync.Mutex
 }
 
 func NewMarketHours() *MarketHours {
@@ -18,10 +25,25 @@ func NewMarketHours() *MarketHours {
 // istLoc is Asia/Kolkata. Fixed offset +05:30, no DST.
 var istLoc = time.FixedZone("IST", 5*60*60+30*60)
 
+// SetOpenOverride forces the open state (sim/dev only — the guard
+// logs that it is active).
+func (m *MarketHours) SetOpenOverride(force bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.forceOpen = force
+}
+
 // StatusAt classifies the given UTC time into the IST trading day.
 func (m *MarketHours) StatusAt(t time.Time) MarketStatus {
+	m.mu.Lock()
+	forced := m.forceOpen
+	holidays := m.Holidays
+	m.mu.Unlock()
+	if forced {
+		return MarketOpen
+	}
 	ist := t.In(istLoc)
-	if m.Holidays[ist.Format("2006-01-02")] {
+	if holidays[ist.Format("2006-01-02")] {
 		return MarketClosed
 	}
 	mins := ist.Hour()*60 + ist.Minute()

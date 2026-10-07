@@ -19,6 +19,7 @@ import (
 	"github.com/Abhijeetsng97/terminalTrade/internal/core"
 	"github.com/Abhijeetsng97/terminalTrade/internal/engine"
 	"github.com/Abhijeetsng97/terminalTrade/internal/marketdata"
+	"github.com/Abhijeetsng97/terminalTrade/internal/sim"
 	"github.com/Abhijeetsng97/terminalTrade/internal/store"
 )
 
@@ -51,6 +52,9 @@ type App struct {
 	// alerts (ops + runtime)
 	alertsMu sync.Mutex
 	alerts   []string
+
+	// sim market (sim mode only)
+	simMarket *sim.Market
 }
 
 // New builds the App (does not start background jobs).
@@ -70,35 +74,43 @@ func New(ctx context.Context, cfg *config.Config, st *store.Store) (*App, error)
 	}
 
 	// wire adapters when credentials exist (sim-only mode runs without)
-	if cfg.KiteAPIKey != "" {
+	if cfg.Sim {
+		a.wireSim(ctx)
+	} else if cfg.KiteAPIKey != "" {
 		a.Kite = kiteadapter.New(cfg.KiteAPIKey, cfg.KiteAPISecret)
 		a.Adapters = append(a.Adapters, a.Kite)
 		eng.RegisterAdapter(a.Kite)
 	}
-	if cfg.FyersAppID != "" {
+	if !cfg.Sim && cfg.FyersAppID != "" {
 		a.Fyers = fyersadapter.New(cfg.FyersAppID, cfg.FyersAppSecret, cfg.FyersRedirectURI, cfg.FyersPIN)
 		a.Adapters = append(a.Adapters, a.Fyers)
 		eng.RegisterAdapter(a.Fyers)
 	}
 
-	// restore sessions + instruments from the store
-	if err := a.restoreSessions(ctx); err != nil {
-		return nil, err
+	// restore sessions + instruments from the store (real brokers
+	// only; sim seeds its own)
+	if !cfg.Sim {
+		if err := a.restoreSessions(ctx); err != nil {
+			return nil, err
+		}
 	}
 	a.reloadInstrumentMaps()
-	a.Kite.SetSymbolResolver(func(sym string) (core.Instrument, bool) {
-		a.symbolMu.RLock()
-		defer a.symbolMu.RUnlock()
-		i, ok := a.kiteBySym[sym]
-		return i, ok
-	})
-	a.Fyers.SetSymbolResolver(func(sym string) (core.Instrument, bool) {
-		a.symbolMu.RLock()
-		defer a.symbolMu.RUnlock()
-		i, ok := a.fyersBySym[sym]
-		return i, ok
-	})
-
+	if a.Kite != nil {
+		a.Kite.SetSymbolResolver(func(sym string) (core.Instrument, bool) {
+			a.symbolMu.RLock()
+			defer a.symbolMu.RUnlock()
+			i, ok := a.kiteBySym[sym]
+			return i, ok
+		})
+	}
+	if a.Fyers != nil {
+		a.Fyers.SetSymbolResolver(func(sym string) (core.Instrument, bool) {
+			a.symbolMu.RLock()
+			defer a.symbolMu.RUnlock()
+			i, ok := a.fyersBySym[sym]
+			return i, ok
+		})
+	}
 	// default risk caps: per-order cap = freeze lots is enforced by
 	// the instrument itself; big-order second confirm at 10 lots.
 	if a.Risk.BigOrderLots == 0 {

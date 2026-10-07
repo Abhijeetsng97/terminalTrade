@@ -329,36 +329,62 @@ func (m *model) updateForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m.form.update(m, msg)
 }
 
-// View renders the page.
+// View renders the page. Layout: top bar / page body (padded to
+// full height) / alert bar / key bar pinned at the bottom.
 func (m *model) View() string {
 	if m.width == 0 {
-		return "loading..."
-	}
-	if m.loginModal != nil {
-		return m.loginModal.view(m)
+		// wish's bubbletea middleware sends WindowSizeMsg before the
+		// first View; belt-and-braces fallback.
+		return "\n  terminalTrade — waiting for terminal size..."
 	}
 	var b strings.Builder
 	b.WriteString(m.renderTopBar())
 	b.WriteString("\n")
-	switch m.page {
-	case pagePositions:
-		b.WriteString(m.renderPositions())
-	case pageChain:
-		b.WriteString(m.renderChain())
-	case pageFunds:
-		b.WriteString(m.renderFunds())
-	case pageBook:
-		b.WriteString(m.renderBook())
+
+	// page body or modals
+	var middle string
+	switch {
+	case m.loginModal != nil:
+		middle = m.loginModal.view(m)
+	default:
+		switch m.page {
+		case pagePositions:
+			middle = m.renderPositions()
+		case pageChain:
+			middle = m.renderChain()
+		case pageFunds:
+			middle = m.renderFunds()
+		case pageBook:
+			middle = m.renderBook()
+		}
 	}
-	b.WriteString("\n")
-	b.WriteString(m.renderAlertBar())
-	b.WriteString("\n")
-	b.WriteString(m.renderKeyBar())
 	if m.form != nil {
-		b.WriteString("\n\n")
-		b.WriteString(m.form.view())
+		middle += "\n\n" + m.form.view()
 	}
+
+	// bottom chrome
+	bottom := m.renderAlertBar() + "\n" + m.renderKeyBar()
+
+	// pad the middle so the chrome pins to the terminal bottom
+	body := m.trimLines(middle, m.height-3)
+	used := len(strings.Split(body, "\n"))
+	pad := m.height - 3 - used
+	if pad > 0 {
+		body += strings.Repeat("\n", pad)
+	}
+	b.WriteString(body)
+	b.WriteString(bottom)
 	return b.String()
+}
+
+// trimLines caps a block at n lines (long pages scroll by cursor in
+// v1; the cap keeps the frame stable).
+func (m *model) trimLines(s string, n int) string {
+	lines := strings.Split(s, "\n")
+	if len(lines) > n {
+		lines = lines[:n]
+	}
+	return strings.Join(lines, "\n")
 }
 
 func (m *model) renderTopBar() string {
