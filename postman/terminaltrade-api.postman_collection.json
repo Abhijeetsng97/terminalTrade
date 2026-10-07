@@ -1,0 +1,214 @@
+{
+	"info": {
+		"name": "terminalTrade API",
+		"_postman_id": "b7e3f2a1-4c5d-4e6f-8a9b-terminaltrade01",
+		"description": "REST API for terminalTrade — the SSH trading terminal for Indian index options (Kite + Fyers).\n\n1. Set the `apiKey` collection variable to your TT_API_KEY.\n2. All `/api/*` endpoints except `/api/health` require `Authorization: Bearer {{apiKey}}`.\n3. The API binds 127.0.0.1 by default — use it locally or behind a TLS reverse proxy.\n\nEvery mutating endpoint goes through the same order engine as the TUI: market-protected limit orders, automatic freeze-quantity slicing (fire-all), idempotency tags, transport-only retries, margin-rejection halts, and the 09:15–15:30 IST market-hours guard.",
+		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+	},
+	"auth": {
+		"type": "bearer",
+		"bearer": [{ "key": "token", "value": "{{apiKey}}", "type": "string" }]
+	},
+	"variables": [
+		{ "key": "baseUrl", "value": "http://127.0.0.1:8080", "type": "string" },
+		{ "key": "apiKey", "value": "", "type": "string" }
+	],
+	"item": [
+		{
+			"name": "System",
+			"item": [
+				{
+					"name": "Health",
+					"request": {
+						"auth": { "type": "noauth" },
+						"method": "GET",
+						"header": [],
+						"url": { "raw": "{{baseUrl}}/api/health", "host": ["{{baseUrl}}"], "path": ["api", "health"] }
+					}
+				}
+			]
+		},
+		{
+			"name": "Market Data",
+			"item": [
+				{
+					"name": "Snapshot (positions + funds + sessions + feed state)",
+					"request": {
+						"method": "GET",
+						"url": { "raw": "{{baseUrl}}/api/snapshot", "host": ["{{baseUrl}}"], "path": ["api", "snapshot"] }
+					}
+				},
+				{
+					"name": "Positions (netted across brokers)",
+					"request": {
+						"method": "GET",
+						"url": { "raw": "{{baseUrl}}/api/positions", "host": ["{{baseUrl}}"], "path": ["api", "positions"] }
+					}
+				},
+				{
+					"name": "Funds",
+					"request": {
+						"method": "GET",
+						"url": { "raw": "{{baseUrl}}/api/funds", "host": ["{{baseUrl}}"], "path": ["api", "funds"] }
+					}
+				},
+				{
+					"name": "Instruments (full universe)",
+					"request": {
+						"method": "GET",
+						"url": { "raw": "{{baseUrl}}/api/instruments", "host": ["{{baseUrl}}"], "path": ["api", "instruments"] }
+					}
+				},
+				{
+					"name": "Instrument by canonical key",
+					"request": {
+						"method": "GET",
+						"url": {
+							"raw": "{{baseUrl}}/api/instruments/NIFTY%3AOPTIDX%3A20261029%3A26300%3ACE",
+							"host": ["{{baseUrl}}"],
+							"path": ["api", "instruments", "NIFTY:OPTIDX:20261029:26300:CE"]
+						},
+						"description": "Canonical key format: UNDERLYING:KIND:YYYYMMDD:STRIKE:CE|PE — e.g. NIFTY:OPTIDX:20261029:26300:CE"
+					}
+				},
+				{
+					"name": "Option chain",
+					"request": {
+						"method": "GET",
+						"url": {
+							"raw": "{{baseUrl}}/api/chain/NIFTY?expiry=2026-10-29",
+							"host": ["{{baseUrl}}"],
+							"path": ["api", "chain", "NIFTY"],
+							"query": [{ "key": "expiry", "value": "2026-10-29", "description": "optional YYYY-MM-DD; defaults to nearest expiry" }]
+						}
+					}
+				}
+			]
+		},
+		{
+			"name": "Orders",
+			"item": [
+				{
+					"name": "Place order (MKT-PROT default)",
+					"request": {
+						"method": "POST",
+						"header": [{ "key": "Content-Type", "value": "application/json" }],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"instrument_key\": \"NIFTY:OPTIDX:20261029:26300:CE\",\n  \"side\": \"BUY\",\n  \"lots\": 54,\n  \"order_type\": \"MKT-PROT\",\n  \"broker\": \"KITE\"\n}"
+						},
+						"url": { "raw": "{{baseUrl}}/api/orders", "host": ["{{baseUrl}}"], "path": ["api", "orders"] },
+						"description": "Places a parent order. The engine slices above the freeze quantity (e.g. NIFTY 100 lots -> 2 slices of 3510 + 2990), assigns idempotency tags, fires all slices, and places market-protected limit orders by default.\n\n- order_type: MKT-PROT (default, limit at LTP±band) or LIMIT (requires limit_price)\n- broker: KITE | FYERS\n- Market must be open (09:15–15:30 IST); risk caps apply."
+					}
+				},
+				{
+					"name": "Place order (explicit LIMIT)",
+					"request": {
+						"method": "POST",
+						"header": [{ "key": "Content-Type", "value": "application/json" }],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"instrument_key\": \"NIFTY:OPTIDX:20261029:26300:CE\",\n  \"side\": \"SELL\",\n  \"lots\": 10,\n  \"order_type\": \"LIMIT\",\n  \"limit_price\": 21.50,\n  \"broker\": \"FYERS\"\n}"
+						},
+						"url": { "raw": "{{baseUrl}}/api/orders", "host": ["{{baseUrl}}"], "path": ["api", "orders"] }
+					}
+				},
+				{
+					"name": "Today's orders (parents + slices)",
+					"request": {
+						"method": "GET",
+						"url": { "raw": "{{baseUrl}}/api/orders", "host": ["{{baseUrl}}"], "path": ["api", "orders"] }
+					}
+				},
+				{
+					"name": "Cancel order/slice",
+					"request": {
+						"method": "POST",
+						"url": {
+							"raw": "{{baseUrl}}/api/orders/sli-abcdef1234567890/cancel",
+							"host": ["{{baseUrl}}"],
+							"path": ["api", "orders", "sli-abcdef1234567890", "cancel"]
+						},
+						"description": "Cancels an open slice by its child order id (from GET /api/orders children)."
+					}
+				},
+				{
+					"name": "Modify order (price/qty)",
+					"request": {
+						"method": "POST",
+						"header": [{ "key": "Content-Type", "value": "application/json" }],
+						"body": { "mode": "raw", "raw": "{\n  \"price\": 20.50,\n  \"qty\": 650\n}" },
+						"url": {
+							"raw": "{{baseUrl}}/api/orders/sli-abcdef1234567890/modify",
+							"host": ["{{baseUrl}}"],
+							"path": ["api", "orders", "sli-abcdef1234567890", "modify"]
+						},
+						"description": "Modifies price and/or qty of an open slice. Qty above the freeze limit is refused client-side with a slice hint."
+					}
+				},
+				{
+					"name": "Square off all positions",
+					"request": {
+						"method": "POST",
+						"header": [],
+						"url": { "raw": "{{baseUrl}}/api/positions/close-all", "host": ["{{baseUrl}}"], "path": ["api", "positions", "close-all"] },
+						"description": "Closes every open position across brokers, one at a time, each via the sliced market-protected path, routed to the broker holding the position."
+					}
+				}
+			]
+		},
+		{
+			"name": "Sessions",
+			"item": [
+				{
+					"name": "Broker session status",
+					"request": {
+						"method": "GET",
+						"url": { "raw": "{{baseUrl}}/api/sessions", "host": ["{{baseUrl}}"], "path": ["api", "sessions"] }
+					}
+				},
+				{
+					"name": "Exchange Kite request_token (daily manual)",
+					"request": {
+						"method": "POST",
+						"header": [{ "key": "Content-Type", "value": "application/json" }],
+						"body": { "mode": "raw", "raw": "{\n  \"token\": \"request_token_from_redirect_url\"\n}" },
+						"url": {
+							"raw": "{{baseUrl}}/api/sessions/KITE/token",
+							"host": ["{{baseUrl}}"],
+							"path": ["api", "sessions", "KITE", "token"]
+						},
+						"description": "Complete the Kite daily login: open the login URL from the session status response, login, copy request_token from the redirect URL, paste here. The session is persisted encrypted."
+					}
+				},
+				{
+					"name": "Exchange Fyers auth code (manual fallback)",
+					"request": {
+						"method": "POST",
+						"header": [{ "key": "Content-Type", "value": "application/json" }],
+						"body": { "mode": "raw", "raw": "{\n  \"token\": \"auth_code_from_redirect\"\n}" },
+						"url": {
+							"raw": "{{baseUrl}}/api/sessions/FYERS/token",
+							"host": ["{{baseUrl}}"],
+							"path": ["api", "sessions", "FYERS", "token"]
+						},
+						"description": "Manual fallback when the daily Fyers auto-refresh fails. Normally Fyers refreshes itself at ~08:30 IST from the stored refresh token."
+					}
+				}
+			]
+		},
+		{
+			"name": "Ops",
+			"item": [
+				{
+					"name": "Refresh instruments (lot sizes + freeze quantities)",
+					"request": {
+						"method": "POST",
+						"url": { "raw": "{{baseUrl}}/api/instruments/refresh", "host": ["{{baseUrl}}"], "path": ["api", "instruments", "refresh"] },
+						"description": "Reloads both brokers' instrument dumps, merges broker symbol maps, and keeps freeze quantities current (NSE revises them by circular — NIFTY went 1800 to 3510 on 2026-10-05). Runs automatically at startup, hourly, and nightly."
+					}
+				}
+			]
+		}
+	]
+}
