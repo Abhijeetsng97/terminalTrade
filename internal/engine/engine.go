@@ -164,7 +164,7 @@ func (e *Engine) PlaceIntent(ctx context.Context, userID string, inst core.Instr
 
 	// fire-all: place every slice; margin rejection halts the rest
 	var firstMarginErr error
-	var lastRejection error
+	var lastRejection *brokers.AdapterError
 	children := make([]core.ChildOrder, 0, len(plan.Quantities))
 	for _, qty := range plan.Quantities {
 		child := core.ChildOrder{
@@ -224,10 +224,14 @@ func (e *Engine) PlaceIntent(ctx context.Context, userID string, inst core.Instr
 	if len(children) == 0 {
 		parent.State = core.StateRejected
 		parent.Updated = e.clock()
-		_ = e.store.SaveParent(ctx, parent)
 		if lastRejection != nil {
+			// the trader sees WHY in the book immediately — not only
+			// after the first reconcile pass
+			parent.Reason = lastRejection.Message
+			_ = e.store.SaveParent(ctx, parent)
 			return parent, lastRejection
 		}
+		_ = e.store.SaveParent(ctx, parent)
 		return parent, fmt.Errorf("all slices rejected")
 	}
 	parent.State = core.StateOpen
@@ -344,8 +348,9 @@ func (e *Engine) loadChild(ctx context.Context, childID string) (core.ChildOrder
 }
 
 // Reconcile converges local state to broker truth. Poll wins: any
-// child whose broker row disagrees is corrected. Returns the number
-// of corrections.
+// child whose broker row disagrees is corrected; then every parent
+// is re-aggregated from its children (fills roll up to the parent
+// row the trader reads). Returns the number of corrections.
 func (e *Engine) Reconcile(ctx context.Context) (int, error) {
 	e.mu.Lock()
 	adapters := make([]brokers.BrokerAdapter, 0, len(e.adapters))
@@ -360,15 +365,55 @@ func (e *Engine) Reconcile(ctx context.Context) (int, error) {
 		if err != nil {
 			continue // broker unreachable: keep local state
 		}
-		byTag := make(map[string]brokers.BrokerOrder, len(rows))
-		for _, r := range rows {
-			byTag[r.Tag] = r
-		}
-		_ = byTag
-		// The store-backed reconciliation matches children by tag.
 		corrections += e.reconcileBroker(ctx, a.Broker(), rows)
 	}
+	// roll children up to parents — the book page reads parents
+	corrections += e.reaggregateParents(ctx)
 	return corrections, nil
+}
+
+// reaggregateParents recomputes every parent's state/filled from its
+// children and persists changes. Without this the book shows OPEN
+// forever even after the broker has COMPLETEd the slices.
+func (e *Engine) reaggregateParents(ctx context.Context) int {
+	parents, err := e.store.ListParents(ctx, "", e.clock().Add(-24*time.Hour))
+	if err != nil {
+		return 0
+	}
+	fixed := 0
+	for _, p := range parents {
+		// halted parents keep their halted state (margin halt is
+		// terminal for the unfilled remainder)
+		if p.State == core.StateHalted {
+			continue
+		}
+		kids, err := e.store.ListChildren(ctx, p.ID)
+		if err != nil || len(kids) == 0 {
+			continue
+		}
+		newState := core.AggregateState(kids)
+		newFilled := 0
+		for _, k := range kids {
+			newFilled += k.FilledQty
+		}
+		if newState != p.State || newFilled != p.FilledQty {
+			p.State = newState
+			p.FilledQty = newFilled
+			p.Updated = e.clock()
+			// rejected parents must show why in the book
+			if newState == core.StateRejected && p.Reason == "" {
+				for _, k := range kids {
+					if k.State == core.StateRejected && k.Reason != "" {
+						p.Reason = k.Reason
+						break
+					}
+				}
+			}
+			_ = e.store.SaveParent(ctx, p)
+			fixed++
+		}
+	}
+	return fixed
 }
 
 // reconcileBroker is store-implementation specific; the engine calls

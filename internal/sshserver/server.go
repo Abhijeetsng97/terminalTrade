@@ -117,7 +117,8 @@ func (s *Server) totpGateMW() wish.Middleware {
 }
 
 // runGatePrompt asks for the 6-digit code; three wrong attempts
-// disconnect (spec: brute force impractical).
+// disconnect (spec: brute force impractical). Digits are shown as
+// typed (requested: visible codes, 30s validity, single-user v1).
 func runGatePrompt(sess ssh.Session, gs *auth.GateSession) bool {
 	prompt := func(masked string) {
 		attempts := 3 - gs.Attempts()
@@ -137,7 +138,7 @@ func runGatePrompt(sess ssh.Session, gs *auth.GateSession) bool {
 			switch {
 			case b >= '0' && b <= '9' && len(code) < 6:
 				code = append(code, b)
-				prompt(strings.Repeat("*", len(code)))
+				prompt(string(code)) // visible, per design decision
 				if len(code) == 6 {
 					ok, allowed := gs.Attempt(string(code))
 					if ok {
@@ -158,7 +159,7 @@ func runGatePrompt(sess ssh.Session, gs *auth.GateSession) bool {
 			case b == 127, b == 8: // backspace
 				if len(code) > 0 {
 					code = code[:len(code)-1]
-					prompt(strings.Repeat("*", len(code)))
+					prompt(string(code)) // visible
 				}
 			}
 		}

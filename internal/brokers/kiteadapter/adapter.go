@@ -205,6 +205,39 @@ func (a *Adapter) ListTrades(ctx context.Context) ([]brokers.BrokerTrade, error)
 // instrument. Wired at startup from the instruments table.
 type SymbolResolver func(tradingSymbol string) (core.Instrument, bool)
 
+// RawQuotes fetches Kite quotes for exchange:symbol keys (used by
+// the quote poller). Kite types are translated here and never leak.
+func (a *Adapter) RawQuotes(ctx context.Context, kiteSyms []string) (map[string]KiteQuote, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	quotes, err := a.kc.GetQuote(kiteSyms...)
+	if err != nil {
+		return nil, classifyKite(err)
+	}
+	out := make(map[string]KiteQuote, len(quotes))
+	for sym, q := range quotes {
+		out[sym] = KiteQuote{
+			LastPrice: q.LastPrice,
+			OI:        q.OI,
+			Bid:       q.Depth.Buy[0].Price,
+			BidQty:    int(q.Depth.Buy[0].Quantity),
+			Ask:       q.Depth.Sell[0].Price,
+			AskQty:    int(q.Depth.Sell[0].Quantity),
+		}
+	}
+	return out, nil
+}
+
+// KiteQuote is the canonical shape of a Kite quote (adapter-owned).
+type KiteQuote struct {
+	LastPrice float64
+	OI        float64
+	Bid       float64
+	BidQty    int
+	Ask       float64
+	AskQty    int
+}
+
 // SetSymbolResolver wires the instruments-table lookup.
 func (a *Adapter) SetSymbolResolver(r SymbolResolver) {
 	a.mu.Lock()
@@ -250,7 +283,7 @@ func (a *Adapter) ListPositions(ctx context.Context) ([]core.Position, error) {
 	return out, nil
 }
 
-// GetFunds: equity-segment margins.
+// GetFunds: equity-segment margins with components.
 func (a *Adapter) GetFunds(ctx context.Context) (core.Funds, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -260,15 +293,32 @@ func (a *Adapter) GetFunds(ctx context.Context) (core.Funds, error) {
 	}
 	eq := margins.Equity
 	av := eq.Available.LiveBalance
-	used := eq.Used.Debits
+	// utilized margin = span + exposure + option premium + debits
+	// (each non-negative component sums to what's actually blocked)
+	used := eq.Used.Span + eq.Used.Exposure + eq.Used.OptionPremium + eq.Used.Debits
+	collateral := eq.Available.Collateral
 	return core.Funds{
-		Broker: core.BrokerKite, Available: av, Used: used, Total: av + used, UpdatedAt: time.Now(),
+		Broker:        core.BrokerKite,
+		Available:     av,
+		Used:          used,
+		// user's model: TOTAL = deployable = available cash + collateral
+		Total:         av + collateral,
+		Span:          eq.Used.Span,
+		Exposure:      eq.Used.Exposure,
+		OptionPremium: eq.Used.OptionPremium,
+		Debits:        eq.Used.Debits,
+		Collateral:    collateral,
+		Net:           eq.Net,
+		UpdatedAt:     time.Now(),
 	}, nil
 }
 
 // LoadInstruments: Kite's NFO CSV dump -> canonical instruments.
-// Freeze quantities are NOT in Kite's dump; they are filled by the
-// NSE-contract-file refresh (ops pipeline) and default to 0 here.
+// Kite's current dump format: options carry InstrumentType "CE"/"PE"
+// with Segment "NFO-OPT" (the legacy OPTIDX/OPTSTK types are gone);
+// Name is the underlying, StrikePrice/LotSize/TickSize/Expiry as
+// expected. Freeze quantities are NOT in Kite's dump; they come from
+// the fallback table (updated by the NSE-contract refresh when wired).
 func (a *Adapter) LoadInstruments(ctx context.Context) ([]core.Instrument, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -276,31 +326,33 @@ func (a *Adapter) LoadInstruments(ctx context.Context) ([]core.Instrument, error
 	if err != nil {
 		return nil, classifyKite(err)
 	}
-	out := make([]core.Instrument, 0, len(raw))
+	out := make([]core.Instrument, 0, len(raw)/4)
 	for _, r := range raw {
-		if r.InstrumentType != "OPTIDX" && r.InstrumentType != "OPTSTK" {
+		// options only: Segment NFO-OPT with CE/PE type
+		if r.Segment != "NFO-OPT" {
 			continue
 		}
 		var otype core.OptionType
-		switch {
-		case strings.HasSuffix(r.Tradingsymbol, "CE"):
+		switch r.InstrumentType {
+		case "CE":
 			otype = core.Call
-		case strings.HasSuffix(r.Tradingsymbol, "PE"):
+		case "PE":
 			otype = core.Put
 		default:
 			continue
 		}
-		var kind core.InstrumentKind
-		if r.InstrumentType == "OPTIDX" {
-			kind = core.KindIndexOption
-		} else {
+		underlying := strings.ToUpper(strings.TrimSpace(r.Name))
+		if underlying == "" {
+			continue
+		}
+		kind := core.KindIndexOption
+		if !isIndexUnderlying(underlying) {
 			kind = core.KindStockOption
 		}
-		expiry := r.Expiry.Time
 		out = append(out, core.Instrument{
-			Underlying:    strings.ToUpper(strings.TrimSpace(r.Name)),
+			Underlying:    underlying,
 			Kind:          kind,
-			Expiry:        expiry,
+			Expiry:        r.Expiry.Time,
 			Strike:        r.StrikePrice,
 			OptionType:    otype,
 			LotSize:       int(r.LotSize),
@@ -310,6 +362,16 @@ func (a *Adapter) LoadInstruments(ctx context.Context) ([]core.Instrument, error
 	}
 	out = NightlyFreezeFill(out)
 	return out, nil
+}
+
+// isIndexUnderlying: the NFO index underlyings (options on these are
+// OPTIDX-class; everything else is a stock option).
+func isIndexUnderlying(u string) bool {
+	switch u {
+	case "NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "NIFTYNXT50", "SENSEX":
+		return true
+	}
+	return false
 }
 
 // NightlyFreezeFill: Kite dump lacks freeze qty; default by

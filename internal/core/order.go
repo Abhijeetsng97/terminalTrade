@@ -75,6 +75,8 @@ type Order struct {
 	// Broker placement is routed to.
 	Broker   Broker
 	State    OrderState
+	// FilledQty rolls up from children (reconcile keeps it fresh).
+	FilledQty int
 	// Reason carries the broker rejection reason / halt cause.
 	Reason  string
 	Created time.Time
@@ -167,11 +169,24 @@ type Position struct {
 	UpdatedAt time.Time
 }
 
-// Funds is a per-broker funds/margin snapshot.
+// Funds is a per-broker funds/margin snapshot. Total is the total
+// margin: Available + Used. Span/Exposure/OptionPremium are the
+// used-margin components where the broker reports them (Kite does;
+// Fyers reports a flat utilized amount — zeros there). Collateral
+// is pledged holdings value usable as margin.
 type Funds struct {
 	Broker    Broker
 	Available float64
 	Used      float64
-	Total     float64
+	Total     float64 // Available + Used
+	// Used-margin components (Kite equity segment).
+	Span          float64
+	Exposure      float64
+	OptionPremium float64
+	Debits        float64
+	// Collateral is the pledged-holdings margin component.
+	Collateral float64
+	// Net is the broker-reported net balance when available.
+	Net       float64
 	UpdatedAt time.Time
 }

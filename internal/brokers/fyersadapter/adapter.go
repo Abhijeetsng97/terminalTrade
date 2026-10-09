@@ -8,7 +8,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -449,138 +448,40 @@ func (a *Adapter) GetFunds(ctx context.Context) (core.Funds, error) {
 	if err := json.Unmarshal([]byte(resp), &out); err != nil {
 		return core.Funds{}, classifyFyers(err, resp)
 	}
-	var available, used float64
+	var available, used, span, exposure, premium, collateral float64
 	for _, f := range out.FundLimit {
 		switch f.Title {
 		case "Available Balance", "Clear Balance", "Available Margin":
 			available = f.EquityAmount
 		case "Utilized Amount", "Utilized Debits", "Total Utilized":
 			used = f.EquityAmount
+		case "SPAN Amount", "SPAN":
+			span = f.EquityAmount
+		case "Exposure Amount", "Exposure":
+			exposure = f.EquityAmount
+		case "Option Premium":
+			premium = f.EquityAmount
+		case "Collateral", "Adhoc Margin", "Pledged Collateral Value":
+			collateral += f.EquityAmount
 		}
 	}
 	return core.Funds{
-		Broker: core.BrokerFyers, Available: available, Used: used, Total: available + used, UpdatedAt: time.Now(),
+		Broker: core.BrokerFyers, Available: available, Used: used,
+		// user's model: TOTAL = deployable = available + collateral
+		Total:         available + collateral,
+		Span:          span, Exposure: exposure, OptionPremium: premium,
+		Collateral:    collateral,
+		UpdatedAt:     time.Now(),
 	}, nil
 }
 
-// LoadInstruments: Fyers master (unresolved symbols) -> canonical.
-// The Fyers master is a large JSON file fetched from their CDN; the
-// SDK does not ship a loader, so we fetch it directly.
+// LoadInstruments: v1 defers the Fyers symbol-master download (no
+// stable public URL; CDN gated). The app layer derives Fyers index-
+// option symbols from the canonical model instead (see app.deriveSymbolsFor
+// + fyers.DeriveSymbol). Returning empty with nil error signals
+// "nothing new" rather than failure, so Kite's dump still loads.
 func (a *Adapter) LoadInstruments(ctx context.Context) ([]core.Instrument, error) {
-	// Fyers instrument master: https://api-t1.fyers.in/data/master-v2.json (no auth)
-	const masterURL = "https://api-t1.fyers.in/data/master-v2.json"
-	req, _ := http.NewRequestWithContext(ctx, "GET", masterURL, nil)
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, &brokers.AdapterError{Kind: brokers.ErrTransport, Message: err.Error(), Err: err}
-	}
-	defer resp.Body.Close()
-	var master map[string]json.RawMessage
-	if err := json.NewDecoder(resp.Body).Decode(&master); err != nil {
-		return nil, &brokers.AdapterError{Kind: brokers.ErrTransport, Message: "parse fyers master: " + err.Error(), Err: err}
-	}
-	return parseFyersMaster(master)
-}
-
-// parseFyersMaster converts the master's per-symbol rows into
-// canonical instruments. Format (v3): symbols carry the same
-// fields as NSE (underlying, expiry, strike, type via the symbol
-// text itself) — we parse from the symbol string.
-func parseFyersMaster(master map[string]json.RawMessage) ([]core.Instrument, error) {
-	out := []core.Instrument{}
-	for sym, raw := range master {
-		if !strings.HasPrefix(sym, "NSE:") || !strings.Contains(sym, "-") {
-			continue
-		}
-		// shape: NSE:NIFTY26O29-26000CE or NSE:NIFTY26O29-26000-CE
-		// actual fyers options: NSE:NIFTY26O2926000CE
-		body := strings.TrimPrefix(sym, "NSE:")
-		if !strings.Contains(body, "CE") && !strings.Contains(body, "PE") {
-			continue
-		}
-		inst, ok := parseFyersOptionSymbol(sym, body)
-		if !ok {
-			continue
-		}
-		_ = raw
-		out = append(out, inst)
-	}
-	return out, nil
-}
-
-// parseFyersOptionSymbol extracts underlying/expiry/strike/type from
-// a Fyers NFO option symbol (e.g. NIFTY26O2926000CE).
-func parseFyersOptionSymbol(full, body string) (core.Instrument, bool) {
-	// find trailing CE/PE
-	var otype core.OptionType
-	switch {
-	case strings.HasSuffix(body, "CE"):
-		otype = core.Call
-	case strings.HasSuffix(body, "PE"):
-		otype = core.Put
-	default:
-		return core.Instrument{}, false
-	}
-	rest := strings.TrimSuffix(body, string(otype))
-	// strike digits at the end
-	i := len(rest)
-	for i > 0 && rest[i-1] >= '0' && rest[i-1] <= '9' {
-		i--
-	}
-	strikeStr := rest[i:]
-	if strikeStr == "" {
-		return core.Instrument{}, false
-	}
-	var strike float64
-	if _, err := fmt.Sscanf(strikeStr, "%g", &strike); err != nil {
-		return core.Instrument{}, false
-	}
-	head := rest[:i] // e.g. NIFTY26O29
-	// expiry: 2-digit year + month letter + day digits
-	mi := len(head)
-	for mi > 0 && head[mi-1] >= '0' && head[mi-1] <= '9' {
-		mi--
-	}
-	dayStr := head[mi:]
-	monthPart := head[:mi] // e.g. NIFTY26O
-	if len(monthPart) < 4 || dayStr == "" {
-		return core.Instrument{}, false
-	}
-	monthLetter := monthPart[len(monthPart)-1]
-	year := monthPart[:len(monthPart)-1] // NIFTY26 etc.
-	// strip year digits from the end of year
-	underlying := year
-	ui := len(underlying)
-	for ui > 0 && underlying[ui-1] >= '0' && underlying[ui-1] <= '9' {
-		ui--
-	}
-	underlying = underlying[:ui]
-	if underlying == "" {
-		return core.Instrument{}, false
-	}
-	months := map[byte]int{'1': 1, '2': 2, '3': 3, '4': 4, '5': 5, '6': 6, '7': 7, '8': 8, '9': 9, 'O': 10, 'N': 11, 'D': 12}
-	m, ok := months[monthLetter]
-	if !ok {
-		return core.Instrument{}, false
-	}
-	year2 := year[len(year)-2:]
-	var y int
-	if _, err := fmt.Sscanf(year2, "%d", &y); err != nil {
-		return core.Instrument{}, false
-	}
-	day := 0
-	if _, err := fmt.Sscanf(dayStr, "%d", &day); err != nil || day == 0 {
-		return core.Instrument{}, false
-	}
-	expiry := time.Date(2000+y, time.Month(m), day, 0, 0, 0, 0, core.LocalIST())
-	return core.Instrument{
-		Underlying:    underlying,
-		Kind:          core.KindIndexOption,
-		Expiry:        expiry,
-		Strike:        strike,
-		OptionType:    otype,
-		BrokerSymbols: map[core.Broker]string{core.BrokerFyers: full},
-	}, true
+	return nil, nil // symbols derived from canonical model in app layer
 }
 
 // classifyFyers separates rejections from transport errors.

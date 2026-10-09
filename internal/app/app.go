@@ -9,10 +9,13 @@ import (
 	"fmt"
 	"slices"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/Abhijeetsng97/terminalTrade/internal/brokers"
+	"github.com/Abhijeetsng97/terminalTrade/internal/brokers/fyers"
 	"github.com/Abhijeetsng97/terminalTrade/internal/brokers/fyersadapter"
 	"github.com/Abhijeetsng97/terminalTrade/internal/brokers/kiteadapter"
 	"github.com/Abhijeetsng97/terminalTrade/internal/config"
@@ -48,6 +51,10 @@ type App struct {
 	kiteBySym   map[string]core.Instrument
 	fyersBySym  map[string]core.Instrument
 	byKey       map[string]core.Instrument
+	// chain-cell index (UNDERLYING|EXPIRY|STRIKE|TYPE -> instrument)
+	// and per-underlying sorted expiries — avoids 36k scans
+	byChainCell          map[string]core.Instrument
+	expiriesByUnderlying map[string][]time.Time
 
 	// alerts (ops + runtime)
 	alertsMu sync.Mutex
@@ -55,6 +62,15 @@ type App struct {
 
 	// sim market (sim mode only)
 	simMarket *sim.Market
+
+	// quote-poller single-instance guard
+	pollMu      sync.Mutex
+	pollRunning bool
+	// poller target (underlying, expiry offset) — retargetable so the
+	// TUI can point it at whatever expiry the user is viewing
+	pollTargetMu   sync.Mutex
+	pollUnderlying string
+	pollOffset     int
 }
 
 // New builds the App (does not start background jobs).
@@ -153,19 +169,26 @@ func (a *App) SaveBrokerTokens(ctx context.Context, broker core.Broker, accessTo
 	return a.Store.SaveCredentials(ctx, string(broker), []byte(blob))
 }
 
-// RefreshInstruments loads both dumps, merges freeze quantities,
-// persists, and reloads the lookup maps (login check + cron + nightly).
+// RefreshInstruments loads instrument dumps per broker and merges
+// them into the store. Per-broker tolerant: one broker failing does
+// NOT block the others (the chain runs on whichever broker loaded).
 func (a *App) RefreshInstruments(ctx context.Context) error {
 	merged := map[string]core.Instrument{}
+	var failures []string
 	for _, ad := range a.Adapters {
 		insts, err := ad.LoadInstruments(ctx)
 		if err != nil {
-			return fmt.Errorf("%s instruments: %w", ad.Broker(), err)
+			failures = append(failures, fmt.Sprintf("%s: %v", ad.Broker(), err))
+			continue // Kite alone can still carry the chain
+		}
+		// broker provided nothing (e.g. Fyers mapping deferred):
+		// synthesize from the canonical model where documented
+		if len(insts) == 0 {
+			insts = a.deriveSymbolsFor(ad.Broker())
 		}
 		for _, i := range insts {
 			key := i.Key()
 			if cur, ok := merged[key]; ok {
-				// merge broker symbols; keep max lot/freeze
 				if cur.BrokerSymbols == nil {
 					cur.BrokerSymbols = map[core.Broker]string{}
 				}
@@ -190,6 +213,9 @@ func (a *App) RefreshInstruments(ctx context.Context) error {
 			}
 		}
 	}
+	if len(merged) == 0 {
+		return fmt.Errorf("no instruments loaded (errors: %v)", failures)
+	}
 	list := make([]core.Instrument, 0, len(merged))
 	for _, i := range merged {
 		list = append(list, i)
@@ -198,11 +224,50 @@ func (a *App) RefreshInstruments(ctx context.Context) error {
 		return err
 	}
 	a.reloadInstrumentMaps()
+	a.alertf("instruments loaded: %d", len(list))
+	if len(failures) > 0 {
+		a.alertf("instrument refresh partial: %s", strings.Join(failures, "; "))
+	}
 	return nil
 }
 
+// deriveSymbolsFor synthesizes broker symbols from the canonical
+// instruments already in the store. v1: Fyers index-option symbology
+// is documented and deterministic (NSE:NIFTY26O2926000CE); wrong
+// derivations surface as broker rejections (-300) at order time.
+// Filled instruments get the derived symbol merged into the store.
+func (a *App) deriveSymbolsFor(b core.Broker) []core.Instrument {
+	if b != core.BrokerFyers {
+		return nil
+	}
+	existing, err := a.Store.LoadInstruments(context.Background())
+	if err != nil || len(existing) == 0 {
+		return nil
+	}
+	var out []core.Instrument
+	changed := false
+	for _, i := range existing {
+		if i.IsOption() && i.Kind == core.KindIndexOption && i.BrokerSymbols[b] == "" {
+			if sym, ok := fyers.DeriveSymbol(i); ok {
+				if i.BrokerSymbols == nil {
+					i.BrokerSymbols = map[core.Broker]string{}
+				}
+				i.BrokerSymbols[b] = sym
+				changed = true
+			}
+		}
+		out = append(out, i)
+	}
+	if changed {
+		a.alertf("fyers symbols derived for index options (validate first trade)")
+	}
+	return out
+}
+
 // reloadInstrumentMaps rebuilds the symbol->instrument lookups from
-// the store.
+// the store. Also builds the chain index (underlying+expiry+strike+
+// type -> instrument) so form opens and chain builds never scan the
+// 36k universe.
 func (a *App) reloadInstrumentMaps() {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -215,6 +280,7 @@ func (a *App) reloadInstrumentMaps() {
 	a.kiteBySym = map[string]core.Instrument{}
 	a.fyersBySym = map[string]core.Instrument{}
 	a.byKey = map[string]core.Instrument{}
+	a.byChainCell = map[string]core.Instrument{}
 	for _, i := range insts {
 		a.byKey[i.Key()] = i
 		if s, ok := i.BrokerSymbols[core.BrokerKite]; ok {
@@ -223,7 +289,36 @@ func (a *App) reloadInstrumentMaps() {
 		if s, ok := i.BrokerSymbols[core.BrokerFyers]; ok {
 			a.fyersBySym[s] = i
 		}
+		// chain-cell index: UNDERLYING|YYYYMMDD|STRIKE|TYPE
+		cell := chainCellKey(i)
+		a.byChainCell[cell] = i
 	}
+	// expiries per underlying
+	a.expiriesByUnderlying = map[string][]time.Time{}
+	for _, i := range insts {
+		if !i.IsOption() || i.Expiry.IsZero() {
+			continue
+		}
+		a.expiriesByUnderlying[i.Underlying] = append(a.expiriesByUnderlying[i.Underlying], i.Expiry)
+	}
+	for u := range a.expiriesByUnderlying {
+		dedup := map[string]time.Time{}
+		for _, e := range a.expiriesByUnderlying[u] {
+			dedup[e.Format("2006-01-02")] = e
+		}
+		var list []time.Time
+		for _, e := range dedup {
+			list = append(list, e)
+		}
+		sort.Slice(list, func(x, j int) bool { return list[x].Before(list[j]) })
+		a.expiriesByUnderlying[u] = list
+	}
+}
+
+// chainCellKey builds the chain-lookup key for an instrument.
+func chainCellKey(i core.Instrument) string {
+	return i.Underlying + "|" + i.Expiry.Format("20060102") + "|" +
+		strconv.FormatFloat(i.Strike, 'f', -1, 64) + "|" + string(i.OptionType)
 }
 
 // InstrumentByKey looks up the canonical instrument.
@@ -240,33 +335,26 @@ func (a *App) UnderlyingKey(underlying string) string {
 	return underlying + ":INDEX"
 }
 
-// ChainRows builds the chain for an underlying + expiry offset.
-// Quotes come from the cache; the row set comes from instruments.
+// ChainExpiries — superseded by the index-based version above.
+
+// ChainRows builds the chain for an underlying + expiry offset from
+// the chain-cell index (O(rows), no universe scans).
 func (a *App) ChainRows(underlying string, expiryOffset int) []core.ChainRow {
-	insts := a.Instruments()
-	expiries := map[string]time.Time{}
-	for _, i := range insts {
-		if i.Underlying == underlying && i.IsOption() && !i.Expiry.IsZero() {
-			expiries[i.Expiry.Format("2006-01-02")] = i.Expiry
-		}
-	}
-	if len(expiries) == 0 {
+	exps := a.ChainExpiries(underlying)
+	if len(exps) == 0 {
 		return nil
 	}
-	sorted := make([]string, 0, len(expiries))
-	for d := range expiries {
-		sorted = append(sorted, d)
-	}
-	sort.Strings(sorted)
-	if expiryOffset >= len(sorted) {
-		expiryOffset = expiryOffset % len(sorted)
-	}
-	target := expiries[sorted[expiryOffset]]
+	off := expiryOffset % len(exps)
+	expiry := exps[off]
 
+	a.symbolMu.RLock()
+	defer a.symbolMu.RUnlock()
+	// collect strikes for this underlying+expiry from the cell index
 	byStrike := map[float64]*core.ChainRow{}
-	strikes := []float64{}
-	for _, i := range insts {
-		if i.Underlying != underlying || !i.IsOption() || !sameDay(i.Expiry, target) {
+	var strikes []float64
+	prefix := underlying + "|" + expiry.Format("20060102") + "|"
+	for cell, i := range a.byChainCell {
+		if !strings.HasPrefix(cell, prefix) {
 			continue
 		}
 		row, ok := byStrike[i.Strike]
@@ -275,11 +363,19 @@ func (a *App) ChainRows(underlying string, expiryOffset int) []core.ChainRow {
 			byStrike[i.Strike] = row
 			strikes = append(strikes, i.Strike)
 		}
-		if q, ok := a.Quotes.Get(i.Key()); ok {
-			if i.OptionType == core.Call {
-				row.CE = &q
-			} else {
-				row.PE = &q
+		if i.OptionType == core.Call {
+			ce := i
+			row.CE = &ce
+			if q, ok := a.Quotes.Get(i.Key()); ok {
+				qc := q
+				row.CEQuote = &qc
+			}
+		} else {
+			pe := i
+			row.PE = &pe
+			if q, ok := a.Quotes.Get(i.Key()); ok {
+				qp := q
+				row.PEQuote = &qp
 			}
 		}
 	}
@@ -291,15 +387,40 @@ func (a *App) ChainRows(underlying string, expiryOffset int) []core.ChainRow {
 	return rows
 }
 
-// ChainInstrument finds the canonical instrument for a chain cell.
+// ChainInstrument finds the canonical instrument for a chain cell
+// (O(1) via the chain index; rebuilds nothing).
 func (a *App) ChainInstrument(underlying string, expiryOffset int, strike float64, otype core.OptionType) *core.Instrument {
-	insts := a.Instruments()
-	for _, i := range insts {
-		if i.Underlying == underlying && i.IsOption() && i.Strike == strike && i.OptionType == otype {
-			return &i
-		}
+	// resolve the expiry for the offset
+	exps := a.ChainExpiries(underlying)
+	if len(exps) == 0 {
+		return nil
+	}
+	off := expiryOffset % len(exps)
+	cell := underlying + "|" + exps[off].Format("20060102") + "|" +
+		strconv.FormatFloat(strike, 'f', -1, 64) + "|" + string(otype)
+	a.symbolMu.RLock()
+	defer a.symbolMu.RUnlock()
+	if i, ok := a.byChainCell[cell]; ok {
+		return &i
 	}
 	return nil
+}
+
+// ChainExpiries returns the sorted non-expired expiries for an
+// underlying (from the reload-time index).
+func (a *App) ChainExpiries(underlying string) []time.Time {
+	a.symbolMu.RLock()
+	defer a.symbolMu.RUnlock()
+	today := time.Now().In(core.LocalIST())
+	today = time.Date(today.Year(), today.Month(), today.Day(), 0, 0, 0, 0, core.LocalIST())
+	all := a.expiriesByUnderlying[underlying]
+	out := make([]time.Time, 0, len(all))
+	for _, e := range all {
+		if !e.Before(today) {
+			out = append(out, e)
+		}
+	}
+	return out
 }
 
 func sameDay(a, b time.Time) bool {
@@ -327,6 +448,8 @@ type Snapshot struct {
 	FeedAt    time.Time
 	Market    core.MarketStatus
 	Sessions  map[string]brokers.SessionStatus
+	// FundsAt is when the funds rows were fetched.
+	FundsAt time.Time
 }
 
 // GetSnapshot fetches positions + funds + statuses in one call.
@@ -334,6 +457,7 @@ func (a *App) GetSnapshot(ctx context.Context) Snapshot {
 	snap := Snapshot{
 		Sessions: map[string]brokers.SessionStatus{},
 		Market:   a.Hours.StatusAt(time.Now()),
+		FundsAt:  time.Now(),
 	}
 	var wg sync.WaitGroup
 	var mu sync.Mutex

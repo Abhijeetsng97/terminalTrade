@@ -129,6 +129,7 @@ type parentDoc struct {
 	Broker     string    `bson:"broker"`
 	State      string    `bson:"state"`
 	Reason     string    `bson:"reason"`
+	FilledQty  int       `bson:"filled_qty"`
 	Created    time.Time `bson:"created"`
 	Updated    time.Time `bson:"updated"`
 }
@@ -162,7 +163,7 @@ func (s *Store) SaveParent(ctx context.Context, o core.Order) error {
 		ID: o.ID, UserID: o.UserID, Instrument: inst, Side: string(o.Side),
 		Lots: o.Lots, TotalQty: o.TotalQty, OrderType: string(o.OrderType),
 		LimitPrice: o.LimitPrice, Broker: string(o.Broker), State: string(o.State),
-		Reason: o.Reason, Created: o.Created, Updated: o.Updated,
+		Reason: o.Reason, FilledQty: o.FilledQty, Created: o.Created, Updated: o.Updated,
 	}
 	_, err = s.db.Collection(ColOrders).ReplaceOne(ctx,
 		bson.D{{Key: "id", Value: o.ID}},
@@ -215,7 +216,7 @@ func (s *Store) ListParents(ctx context.Context, userID string, since time.Time)
 			Side: core.Side(d.Side), Lots: d.Lots, TotalQty: d.TotalQty,
 			OrderType: core.OrderType(d.OrderType), LimitPrice: d.LimitPrice,
 			Broker: core.Broker(d.Broker), State: core.OrderState(d.State),
-			Reason: d.Reason, Created: d.Created, Updated: d.Updated,
+			Reason: d.Reason, FilledQty: d.FilledQty, Created: d.Created, Updated: d.Updated,
 		})
 	}
 	return out, nil
@@ -329,6 +330,13 @@ type instDoc struct {
 	TickSize     float64            `bson:"tick_size"`
 	BrokerSymbols map[string]string `bson:"broker_symbols"`
 	UpdatedAt    time.Time          `bson:"updated_at"`
+}
+
+// ClearInstruments wipes the universe (sim reseeding: each restart
+// mints a fresh nearest expiry; old-run instruments must not linger).
+func (s *Store) ClearInstruments(ctx context.Context) error {
+	_, err := s.db.Collection(ColInstruments).DeleteMany(ctx, bson.D{})
+	return err
 }
 
 // SaveInstruments replaces the instrument universe (upsert per key).

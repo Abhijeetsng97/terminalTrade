@@ -5,7 +5,6 @@ package sim
 
 import (
 	"context"
-	"fmt"
 	"strings"
 	"sync"
 	"time"
@@ -98,27 +97,41 @@ func (a *Adapter) ExchangeManualToken(ctx context.Context, token string) (string
 
 func (a *Adapter) LoginURL() string { return "https://sim.local/login" }
 
+// PlaceOrder accepts the order and schedules the auto-fill.
 func (a *Adapter) PlaceOrder(ctx context.Context, req brokers.OrderRequest) (string, error) {
 	a.mu.Lock()
-	defer a.mu.Unlock()
 	if a.Latency > 0 {
+		a.mu.Unlock()
 		time.Sleep(a.Latency)
+		a.mu.Lock()
 	}
 	if a.FailNextTransport > 0 {
 		a.FailNextTransport--
+		a.mu.Unlock()
 		return "", &brokers.AdapterError{Kind: brokers.ErrTransport, Message: "simulated timeout"}
 	}
 	if a.FailNextMargin > 0 {
 		a.FailNextMargin--
+		a.mu.Unlock()
 		return "", &brokers.AdapterError{Kind: brokers.ErrMarginRejection, Message: "RMS: insufficient margin"}
 	}
+	id := "sim-" + req.IdempotencyTag
 	if !a.session {
 		return "", &brokers.AdapterError{Kind: brokers.ErrRejection, Message: "session expired"}
 	}
-	a.nextID++
-	id := fmt.Sprintf("sim-%d", a.nextID)
-	a.orders[id] = &simOrder{req: req, status: core.StateOpen}
+	a.orders[id] = &simOrder{id: id, req: req, status: core.StateOpen}
 	a.placed = append(a.placed, req)
+	a.mu.Unlock()
+
+	// auto-fill: market-protected orders fill on the next tick, like
+	// a real exchange matching a marketable limit. This is what makes
+	// sim-mode testing meaningful (fills land in the book).
+	if req.OrderType == core.TypeMarketProtected {
+		go func() {
+			time.Sleep(1 * time.Second)
+			a.Fill(id, req.Qty)
+		}()
+	}
 	return id, nil
 }
 

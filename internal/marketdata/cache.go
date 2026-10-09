@@ -4,6 +4,7 @@
 package marketdata
 
 import (
+	"fmt"
 	"strings"
 	"sync"
 	"time"
@@ -72,14 +73,15 @@ func (c *Cache) Set(q core.Quote, broker core.Broker, live bool) {
 }
 
 // PollTick records that the REST fallback produced a value for this
-// broker (feeds flipped to POLL).
+// broker (feeds flipped to POLL). Promotes STALE -> POLL and refreshes
+// the freshness timestamp.
 func (c *Cache) PollTick(broker core.Broker) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.feeds[broker] == Live {
+	if c.feeds[broker] != Live {
 		c.feeds[broker] = Poll
 	}
-	if c.state == Live {
+	if c.state != Live {
 		c.state = Poll
 	}
 	c.lastTick[broker] = c.clock()
@@ -100,6 +102,22 @@ func (c *Cache) MarkWSUp(broker core.Broker) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.feeds[broker] = Live
+}
+
+// FeedSummary is the human-readable feed line for the top bar.
+func FeedSummary(state FeedState, at time.Time) string {
+	switch state {
+	case Live:
+		return "LIVE"
+	case Poll:
+		return "POLL"
+	default:
+		if at.IsZero() {
+			return "STALE (no data yet)"
+		}
+		age := time.Since(at)
+		return fmt.Sprintf("STALE since %s (%.0fs ago)", at.Format("15:04:05"), age.Seconds())
+	}
 }
 
 // State returns the overall freshness, demoting to STALE if no tick
@@ -139,7 +157,10 @@ func (c *Cache) Get(key string) (core.Quote, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	q, ok := c.entries[key]
-	return q.Quote, ok
+	if !ok || q == nil {
+		return core.Quote{}, false
+	}
+	return q.Quote, true
 }
 
 // FeedStateOf reports per-broker state.

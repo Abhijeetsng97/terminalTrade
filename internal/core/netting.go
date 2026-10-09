@@ -68,6 +68,10 @@ type Quote struct {
 // ChainRow is one strike's CE + PE quotes for the chain page.
 type ChainRow struct {
 	Strike float64
-	CE     *Quote
-	PE     *Quote
+	// Canonical instruments for each side (nil when unlisted).
+	CE *Instrument
+	PE *Instrument
+	// Quotes when available (nil when not yet quoted).
+	CEQuote *Quote
+	PEQuote *Quote
 }

@@ -302,7 +302,24 @@ func TestReconcileConverges(t *testing.T) {
 	if kids2[0].State != core.StateFilled {
 		t.Errorf("after reconcile child state %s, want FILLED", kids2[0].State)
 	}
-	_ = st
+	// the parent must roll up too — the book page reads parents, and
+	// "OPEN 0/130" on a completed order was the bug
+	ps, _ := st.ListParents(context.Background(), "", time.Time{})
+	var got *core.Order
+	for i := range ps {
+		if ps[i].ID == parent.ID {
+			got = &ps[i]
+		}
+	}
+	if got == nil {
+		t.Fatal("parent missing from store")
+	}
+	if got.State != core.StateFilled {
+		t.Errorf("after reconcile parent state %s, want FILLED", got.State)
+	}
+	if got.FilledQty != kids2[0].FilledQty {
+		t.Errorf("parent FilledQty %d, want %d (rolled up from children)", got.FilledQty, kids2[0].FilledQty)
+	}
 }
 
 // simBroker adapts the sim adapter to the SIM broker name used in tests.
