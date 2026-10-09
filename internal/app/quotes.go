@@ -75,6 +75,10 @@ func (a *App) PollTarget() (string, int) {
 }
 
 // pollQuotesOnce fetches quotes for the chain strikes + underlying.
+// Not market-hours gated: Kite's GetQuote returns the last close price
+// after the session, so the chain keeps showing data for testing and
+// review. (Order placement is where the broker — not us — enforces
+// market hours.)
 func (a *App) pollQuotesOnce(ctx context.Context, underlying string, expiryOffset int) {
 	insts := a.chainInstruments(underlying, expiryOffset)
 	syms := make([]string, 0, len(insts)+2)
@@ -136,6 +140,8 @@ func kiteIndexSymbol(u string) string {
 		return "NSE:FIN NIFTY"
 	case "MIDCPNIFTY":
 		return "NSE:NIFTY MID SELECT"
+	case "SENSEX":
+		return "BSE:SENSEX"
 	default:
 		return ""
 	}

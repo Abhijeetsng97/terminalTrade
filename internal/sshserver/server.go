@@ -56,9 +56,13 @@ func New(a *app.App, gate *auth.Gate, addr, hostKeyPath string) (*Server, error)
 		wish.WithAddress(addr),
 		wish.WithHostKeyPath(hostKeyPath),
 		wish.WithPublicKeyAuth(s.pubKeyHandler),
+		// wish composes middlewares "first to last, last executed
+		// first" — so the LAST entry here is the OUTERMOST and runs
+		// first. The TOTP gate must be outermost (gate before the TUI),
+		// bubbletea innermost (its `next` after the TUI quits is the
+		// no-op base handler, so quitting closes the session instead
+		// of re-running the gate).
 		wish.WithMiddleware(
-			s.totpGateMW(),
-			activeterm.Middleware(),
 			bubbleteamw.Middleware(func(sess ssh.Session) (tea.Model, []tea.ProgramOption) {
 				m := tuiapp.New(a)
 				// MakeOptions wires input/output/renderer; AltScreen
@@ -66,6 +70,8 @@ func New(a *app.App, gate *auth.Gate, addr, hostKeyPath string) (*Server, error)
 				opts := append(bubbleteamw.MakeOptions(sess), tea.WithAltScreen())
 				return m, opts
 			}),
+			activeterm.Middleware(),
+			s.totpGateMW(),
 		),
 	)
 	if err != nil {

@@ -101,8 +101,10 @@ func (a *App) watchSessions(ctx context.Context) {
 }
 
 // reconcileLoop converges local order state to broker truth. Runs
-// every 5s while the market is open — fills/rejects/cancels land in
-// seconds, not at the next app restart.
+// every 5s regardless of market hours — the broker order book is
+// queryable outside the session, and completed/rejected orders must
+// converge even after the close (the book showed OPEN forever when
+// this was gated on CanPlace).
 func (a *App) reconcileLoop(ctx context.Context) {
 	t := time.NewTicker(5 * time.Second)
 	defer t.Stop()
@@ -111,9 +113,6 @@ func (a *App) reconcileLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			if !a.Hours.CanPlace(time.Now()) {
-				continue // market closed: broker books are frozen anyway
-			}
 			n, err := a.Engine.Reconcile(ctx)
 			if err != nil {
 				a.alertf("reconcile failed: %v", err)

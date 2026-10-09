@@ -496,3 +496,24 @@ func (a *App) GetSnapshot(ctx context.Context) Snapshot {
 func jsonUnmarshal(raw []byte, v any) error {
 	return json.Unmarshal(raw, v)
 }
+
+// OrderMargin returns the broker-calculated margin for a single leg,
+// or a zero margin when the broker has no calculator (Fyers, sim).
+func (a *App) OrderMargin(ctx context.Context, broker core.Broker, inst core.Instrument, side core.Side, qty int, price float64) (brokers.Margin, error) {
+	if a.Kite == nil || broker != core.BrokerKite {
+		return brokers.Margin{}, nil
+	}
+	return a.Kite.OrderMargin(ctx, brokers.OrderRequest{
+		Instrument: inst, Side: side, Qty: qty,
+		OrderType: core.TypeLimit, LimitPrice: price,
+	})
+}
+
+// BasketMargin returns the combined net margin for a spread (e.g. a
+// short + hedge long), or zero when the broker has no calculator.
+func (a *App) BasketMargin(ctx context.Context, broker core.Broker, legs []brokers.OrderRequest) (brokers.Margin, error) {
+	if a.Kite == nil || broker != core.BrokerKite {
+		return brokers.Margin{}, nil
+	}
+	return a.Kite.BasketMargin(ctx, legs)
+}

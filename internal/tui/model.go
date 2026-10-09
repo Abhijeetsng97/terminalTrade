@@ -11,7 +11,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
@@ -84,6 +83,8 @@ type model struct {
 	squareOffConfirm bool
 	// broker login modal
 	loginModal  *loginModal
+	// book modify modal (edit a stop-loss trigger)
+	bookEdit    *bookEditModal
 	// alert banner
 	alerts []string
 	lastKeyTime time.Time
@@ -120,8 +121,14 @@ type refreshMsg struct {
 // placeResultMsg lands when the engine finishes an order round-trip.
 type placeResultMsg struct{ err error }
 
+// marginResultMsg lands when an async margin-calculator call returns.
+type marginResultMsg struct{ text string }
+
 // loginResultMsg lands when a broker token exchange completes.
 type loginResultMsg struct{ info, err string }
+
+// bookActionResultMsg lands when a book cancel/modify round-trip completes.
+type bookActionResultMsg struct{ info, err string }
 
 // Init starts the refresh loop.
 func (m *model) Init() tea.Cmd { return tea.Tick(time.Second, func(t time.Time) tea.Msg { return tickMsg(t) }) }
@@ -158,6 +165,12 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case marginResultMsg:
+		if m.form != nil {
+			m.form.marginText = msg.text
+		}
+		return m, nil
+
 	case loginResultMsg:
 		if m.loginModal != nil {
 			m.loginModal.working = false
@@ -169,6 +182,20 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case bookActionResultMsg:
+		// book cancel/modify finished: close the edit modal, surface
+		// the outcome in the alert banner
+		m.bookEdit = nil
+		if msg.err != "" {
+			m.alerts = append(m.alerts, "book action failed: "+msg.err)
+		} else if msg.info != "" {
+			m.alerts = append(m.alerts, msg.info)
+		}
+		if len(m.alerts) > 20 {
+			m.alerts = m.alerts[len(m.alerts)-20:]
+		}
+		return m, m.tickCmd() // refetch the book to show the new state
+
 	case tea.KeyMsg:
 		// Ctrl+C exits from anywhere (gate, modal, form, page) —
 		// standard terminal muscle memory.
@@ -178,6 +205,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// modal-first handling
 		if m.loginModal != nil {
 			return m.loginModal.update(m, msg)
+		}
+		if m.bookEdit != nil {
+			return m.bookEdit.update(m, msg)
 		}
 		if m.form != nil {
 			return m.updateForm(msg)
@@ -363,13 +393,11 @@ func (m *model) updateChainKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.zone++
 		}
 	case "w":
-		m.expiryOffset++
-		// retarget the quote poller so the new expiry starts
-		// receiving quotes immediately (not on the next cycle)
-		m.app.RetargetPoller(m.underlying(), m.expiryOffset)
-		m.cursor = m.centerOnATM()
-		m.chainTop = m.syncViewport(m.chainTop)
-		return m, m.tickCmd() // fetch the new expiry's chain now
+		return m, m.cycleExpiry(1)
+	case "W":
+		return m, m.cycleExpiry(-1)
+	case "u":
+		return m, m.cycleUnderlying()
 	case "a":
 		m.cursor = m.centerOnATM()
 		m.chainTop = m.syncViewport(m.chainTop)
@@ -383,12 +411,46 @@ func (m *model) updateChainKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// cycleExpiry moves the expiry offset forward (+1) or back (-1),
+// retargets the quote poller, and refetches the chain immediately.
+func (m *model) cycleExpiry(dir int) tea.Cmd {
+	exps := m.app.ChainExpiries(m.underlying())
+	if len(exps) == 0 {
+		return nil
+	}
+	n := (m.expiryOffset + dir) % len(exps)
+	if n < 0 {
+		n += len(exps)
+	}
+	m.expiryOffset = n
+	m.app.RetargetPoller(m.underlying(), m.expiryOffset)
+	m.cursor = m.centerOnATM()
+	m.chainTop = m.syncViewport(m.chainTop)
+	return m.tickCmd()
+}
+
+// cycleUnderlying advances to the next configured underlying,
+// retargets the poller, and refetches.
+func (m *model) cycleUnderlying() tea.Cmd {
+	us := m.app.Cfg.Underlyings
+	if len(us) <= 1 {
+		return nil
+	}
+	m.underlyingIdx = (m.underlyingIdx + 1) % len(us)
+	m.expiryOffset = 0
+	m.app.RetargetPoller(m.underlying(), 0)
+	m.cursor = m.centerOnATM()
+	m.chainTop = m.syncViewport(m.chainTop)
+	return m.tickCmd()
+}
+
 // visibleChainRows computes how many chain rows fit the terminal,
 // capped at 25 so the page shows a tight window around ATM instead
 // of every strike on tall screens.
 func (m *model) visibleChainRows() int {
-	// chrome: top bar(1) + blank(1) + header(1) + colheader(1) + alert(1) + keys(1)
-	h := m.height - 6
+	// chrome: top bar(1) + blank(1) + header(1) + sparkline(1) +
+	// colheader(1) + alert(1) + keys(1)
+	h := m.height - 7
 	if h < 3 {
 		h = 3
 	}
@@ -417,9 +479,68 @@ func (m *model) syncViewport(top int) int {
 }
 
 func (m *model) updateBookKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	// v1: cancel via API key handling on selected row is delegated
-	// to the form layer; book is read-mostly with X to cancel.
+	switch msg.String() {
+	case "up", "k":
+		if m.cursor > 0 {
+			m.cursor--
+		}
+	case "down", "j":
+		if m.cursor < len(m.bookParents)-1 {
+			m.cursor++
+		}
+	case "e":
+		if p := m.selectedBookParent(); p != nil {
+			m.expanded[p.ID] = !m.expanded[p.ID]
+		}
+	case "x", "X":
+		if p := m.selectedBookParent(); p != nil {
+			return m, m.cancelBookOrder(p)
+		}
+	case "m", "M":
+		if p := m.selectedBookParent(); p != nil {
+			if p.OrderType != core.TypeStopLoss {
+				m.alerts = append(m.alerts, "modify supports stop-loss orders only (v1)")
+				if len(m.alerts) > 20 {
+					m.alerts = m.alerts[len(m.alerts)-20:]
+				}
+				return m, nil
+			}
+			m.bookEdit = newBookEditModal(*p)
+		}
+	}
 	return m, nil
+}
+
+// selectedBookParent returns the parent at the book cursor, or nil.
+func (m *model) selectedBookParent() *core.Order {
+	if m.cursor < 0 || m.cursor >= len(m.bookParents) {
+		return nil
+	}
+	return &m.bookParents[m.cursor]
+}
+
+// cancelBookOrder cancels every open child of a parent (async).
+func (m *model) cancelBookOrder(p *core.Order) tea.Cmd {
+	userID := m.app.UserID
+	eng := m.app.Engine
+	parentID := p.ID
+	return func() tea.Msg {
+		kids, err := eng.Children(ctxBG(), parentID)
+		if err != nil {
+			return bookActionResultMsg{err: err.Error()}
+		}
+		cancelled := 0
+		for _, k := range kids {
+			if k.State != core.StateOpen && k.State != core.StatePartiallyFilled {
+				continue
+			}
+			if err := eng.CancelChild(ctxBG(), userID, k.ID); err != nil {
+				return bookActionResultMsg{err: err.Error()}
+			}
+			cancelled++
+		}
+		return bookActionResultMsg{info: fmt.Sprintf("cancelled %d slice(s)", cancelled)}
+	}
 }
 
 func (m *model) centerOnATM() int {
@@ -549,6 +670,8 @@ func (m *model) View() string {
 		middle = m.renderAlerts()
 	case m.loginModal != nil:
 		middle = m.loginModal.view(m)
+	case m.bookEdit != nil:
+		middle = m.bookEdit.view(m)
 	default:
 		switch m.page {
 		case pagePositions:
@@ -745,19 +868,21 @@ func (m *model) renderChain() string {
 	return b.String()
 }
 
-// padRight pads s to display width w (rune-count, not bytes — the ₹
-// glyph is one cell but 3 bytes, which broke %-Ns alignment).
+// padRight pads s to display width w. Width is measured via
+// lipgloss.Width (ANSI-aware): styled strings carry colour escapes
+// that render as zero cells, so a rune-count would over-pad and
+// collapse the columns together.
 func padRight(s string, w int) string {
-	width := utf8.RuneCountInString(strings.TrimSpace(s))
+	width := lipgloss.Width(s)
 	if width >= w {
 		return s
 	}
 	return s + strings.Repeat(" ", w-width)
 }
 
-// padLeft right-aligns s to display width w.
+// padLeft right-aligns s to display width w (ANSI-aware).
 func padLeft(s string, w int) string {
-	width := utf8.RuneCountInString(strings.TrimSpace(s))
+	width := lipgloss.Width(s)
 	if width >= w {
 		return s
 	}
@@ -768,34 +893,36 @@ func (m *model) renderFunds() string {
 	var b strings.Builder
 	b.WriteString(headerStyle.Render(fmt.Sprintf("FUNDS, MARGIN & COLLATERAL   refreshed %.0fs ago", time.Since(m.snapshot.FundsAt).Seconds())))
 	b.WriteString("\n")
-	// header (plain ASCII widths, left-aligned first col)
-	b.WriteString(padRight("BROKER", 12) +
-		padLeft("AVAILABLE", 16) +
-		padLeft("USED MARGIN", 16) +
-		padLeft("COLLATERAL", 16) +
-		padLeft("TOTAL", 16))
+	// header (ANSI-aware widths; broker name left-aligned, numbers right)
+	b.WriteString(padRight("BROKER", 10) +
+		padLeft("AVAILABLE", 14) +
+		padLeft("USED", 12) +
+		padLeft("COLLATERAL", 14) +
+		padLeft("TOTAL (dep)", 14) +
+		padLeft("FREE", 12))
 	b.WriteString("\n")
 	var avail, used, coll, total float64
 	for _, f := range m.snapshot.Funds {
 		if f.Total == 0 && f.Available == 0 && f.Collateral == 0 {
-			// broker with no session: skip the fake zero row, say why
-			b.WriteString(padRight(brokerColor(f.Broker, string(f.Broker)), 12) +
+			b.WriteString(padRight(brokerColor(f.Broker, string(f.Broker)), 10) +
 				dimStyle.Render("no session — press L to login"))
 			b.WriteString("\n")
 			continue
 		}
-		b.WriteString(padRight(brokerColor(f.Broker, string(f.Broker)), 12) +
-			padLeft(money(f.Available), 16) +
-			padLeft(money(f.Used), 16) +
-			padLeft(money(f.Collateral), 16) +
-			padLeft(money(f.Total), 16))
+		free := f.Total - f.Used
+		b.WriteString(padRight(brokerColor(f.Broker, string(f.Broker)), 10) +
+			padLeft(money(f.Available), 14) +
+			padLeft(money(f.Used), 12) +
+			padLeft(money(f.Collateral), 14) +
+			padLeft(money(f.Total), 14) +
+			padLeft(money(free), 12))
 		b.WriteString("\n")
+		// used-margin components on a clean indented line
 		b.WriteString(dimStyle.Render(
-			padRight("  components", 12) +
-				padLeft("span "+money(f.Span), 16) +
-				padLeft("expos "+money(f.Exposure), 16) +
-				padLeft("prem "+money(f.OptionPremium), 16) +
-				padLeft("deb "+money(f.Debits), 16)))
+			"    span " + money(f.Span) +
+				" · exposure " + money(f.Exposure) +
+				" · premium " + money(f.OptionPremium) +
+				" · debits " + money(f.Debits)))
 		b.WriteString("\n")
 		avail += f.Available
 		used += f.Used
@@ -803,15 +930,14 @@ func (m *model) renderFunds() string {
 		total += f.Total
 	}
 	b.WriteString(headerStyle.Render(
-		padRight("COMBINED", 12) +
-			padLeft(money(avail), 16) +
-			padLeft(money(used), 16) +
-			padLeft(money(coll), 16) +
-			padLeft(money(total), 16)))
+		padRight("COMBINED", 10) +
+			padLeft(money(avail), 14) +
+			padLeft(money(used), 12) +
+			padLeft(money(coll), 14) +
+			padLeft(money(total), 14) +
+			padLeft(money(total-used), 12)))
 	b.WriteString("\n")
-	b.WriteString(dimStyle.Render("TOTAL = available + collateral (deployable)   ·   used = span + exposure + premium + debits"))
-	b.WriteString("\n")
-	b.WriteString(dimStyle.Render("buying power ≈ total (available + collateral)"))
+	b.WriteString(dimStyle.Render("TOTAL (deployable) = available + collateral   ·   used = span + exposure + premium + debits   ·   free = total − used"))
 	return b.String()
 }
 
@@ -827,9 +953,9 @@ func (m *model) renderBook() string {
 		b.WriteString(dimStyle.Render("no orders today"))
 		return b.String()
 	}
-	b.WriteString(fmt.Sprintf("%-6s %-30s %-5s %-14s %-9s %-8s\n",
-		"TIME", "INSTRUMENT", "SIDE", "QTY", "TYPE", "STATE"))
-	for _, p := range parents {
+	b.WriteString(fmt.Sprintf("%-6s %-7s %-30s %-5s %-14s %-9s %-8s\n",
+		"TIME", "BROKER", "INSTRUMENT", "SIDE", "QTY", "TYPE", "STATE"))
+	for i, p := range parents {
 		kids := m.bookChildren[p.ID]
 		filled := p.FilledQty
 		if filled == 0 && len(kids) > 0 {
@@ -843,20 +969,36 @@ func (m *model) renderBook() string {
 			stateTxt = greenStyle.Render(string(p.State))
 		case core.StateRejected, core.StateHalted:
 			stateTxt = redStyle.Render(string(p.State))
+		case core.StateStale:
+			stateTxt = dimStyle.Render(string(p.State))
 		}
-		b.WriteString(fmt.Sprintf("%-6s %-30s %-5s %5d/%-8d %-9s %-8s\n",
-			p.Created.Format("15:04"), displayInstrument(p.Instrument), p.Side,
-			filled, p.TotalQty, p.OrderType, stateTxt))
-		// rejection/halt reason: the trader must see WHY, not just
-		// REJECTED — and it must be visible without expanding slices
-		if p.Reason != "" && (p.State == core.StateRejected || p.State == core.StateHalted) {
+		// type column carries the trigger for stop-loss orders
+		typeTxt := string(p.OrderType)
+		if p.OrderType == core.TypeStopLoss && p.TriggerPrice > 0 {
+			typeTxt = fmt.Sprintf("SL@%.0f", p.TriggerPrice)
+		}
+		cursor := "  "
+		if i == m.cursor {
+			cursor = "▶ "
+		}
+		line := fmt.Sprintf("%s%-6s %-7s %-30s %-5s %5d/%-8d %-9s %-8s\n",
+			cursor, p.Created.Format("15:04"), brokerColor(p.Broker, string(p.Broker)),
+			displayInstrument(p.Instrument), p.Side,
+			filled, p.TotalQty, typeTxt, stateTxt)
+		if i == m.cursor {
+			line = atmStyle.Render(line)
+		}
+		b.WriteString(line)
+		// rejection/halt/stale reason: the trader must see WHY, not
+		// just the state — visible without expanding slices
+		if p.Reason != "" && (p.State == core.StateRejected || p.State == core.StateHalted || p.State == core.StateStale) {
 			b.WriteString("        " + redStyle.Render("↳ "+p.Reason) + "\n")
 		}
 		for _, k := range kids {
 			if m.expanded[p.ID] {
 				b.WriteString(fmt.Sprintf("    slice %-25s %5d/%-8d %-9s %s\n",
 					k.ID, k.FilledQty, k.Qty, "", k.State))
-				if k.Reason != "" && (k.State == core.StateRejected) {
+				if k.Reason != "" && (k.State == core.StateRejected || k.State == core.StateStale) {
 					b.WriteString("        " + redStyle.Render("↳ "+k.Reason) + "\n")
 				}
 			}
@@ -886,7 +1028,7 @@ func (m *model) renderKeyBar() string {
 	case pagePositions:
 		return dimStyle.Render("1/2/3/4 pages · ↑↓ select · e expand · C close · Q square-off-all · L login · q q quit")
 	case pageChain:
-		return dimStyle.Render("1/2/3/4 pages · ↑↓ strike · ←→ CE/strike/PE · w expiry · a ATM · B buy S sell · ! alerts · L login · q q quit")
+		return dimStyle.Render("1/2/3/4 pages · ↑↓ strike · ←→ CE/strike/PE · w/W expiry · u index · a ATM · B buy S sell · ! alerts · L login · q q quit")
 	case pageFunds:
 		return dimStyle.Render("1/2/3/4 pages · L login · q q quit")
 	case pageBook:
@@ -910,30 +1052,26 @@ func money(f float64) string {
 }
 
 // indianRupees renders Indian-grouped rupees: ₹12,34,56,789.00
-// (2-2-3 grouping from the right: crore, lakh, thousand).
+// (2-2-3 grouping from the right: crore, lakh, thousand). No leading
+// zero-pad — ₹1,90,287, never ₹01,90,287.
 func indianRupees(f float64) string {
 	paise := int64(math.Round(f * 100))
 	whole := paise / 100
 	p := paise % 100
 
 	digits := strconv.FormatInt(whole, 10)
-	// Indian grouping: last 3, then pairs
-	var b strings.Builder
 	n := len(digits)
+	var b strings.Builder
 	if n > 3 {
-		rest, last3 := digits[:n-3], digits[n-3:]
-		// pad rest to a multiple of 2 for pair-splitting
-		if pad := len(rest) % 2; pad != 0 {
-			rest = "0" + rest
-		}
-		for i, ch := range rest {
-			if i > 0 && i%2 == 0 {
+		lead, last3 := digits[:n-3], digits[n-3:]
+		// group the leading part in pairs from the right
+		for i := 0; i < len(lead); i++ {
+			if i > 0 && (len(lead)-i)%2 == 0 {
 				b.WriteByte(',')
 			}
-			b.WriteRune(ch)
+			b.WriteByte(lead[i])
 		}
-		// strip the padding comma we may have introduced
-		b.WriteString(",")
+		b.WriteByte(',')
 		b.WriteString(last3)
 	} else {
 		b.WriteString(digits)
@@ -1000,11 +1138,25 @@ type orderForm struct {
 	inst       core.Instrument
 	side       core.Side
 	lotsInput  textinput.Model
+	priceInput textinput.Model
+	slInput    textinput.Model
 	broker     core.Broker
 	brokerLocked bool
 	isClose        bool
-	confirming     bool
-	confirmText    string
+	// otype: MKT-PROT (default) or LIMIT. LIMIT uses priceInput.
+	otype core.OrderType
+	// focus: 0 = lots, 1 = price (price only for LIMIT), 2 = SL trigger
+	// (SELL only).
+	focus int
+	// hedge: SELL-only defined-risk spread (BUY next OTM strike).
+	hedge     bool
+	hedgeInst core.Instrument
+	// hedgeDepth: how many strikes OTM the hedge leg sits (1 = nearest).
+	hedgeDepth int
+	confirming  bool
+	confirmText string
+	// marginText: async margin-calculator result shown on confirm.
+	marginText string
 	// placing locks the form while the order round-trip runs (async)
 	placing bool
 	err     string
@@ -1019,11 +1171,24 @@ func newOrderForm(a *app.App, inst core.Instrument, side core.Side, lots float64
 	if lots > 0 {
 		ti.SetValue(fmt.Sprintf("%.0f", lots))
 	}
+	pi := textinput.New()
+	pi.Placeholder = "price"
+	si := textinput.New()
+	si.Placeholder = "SL trigger"
+	// default stop-loss trigger on a short: 10% above the premium
+	if side == core.SideSell {
+		if ltp, ok := a.Quotes.LTP(inst.Key()); ok && ltp > 0 {
+			si.SetValue(fmt.Sprintf("%.2f", core.SnapToTick(ltp*1.10, inst.TickSize)))
+		}
+	}
 	b := core.Broker(broker)
 	if b == "" {
 		b = core.BrokerKite
 	}
-	return &orderForm{app: a, inst: inst, side: side, lotsInput: ti, broker: b}
+	return &orderForm{
+		app: a, inst: inst, side: side, lotsInput: ti, priceInput: pi, slInput: si,
+		broker: b, otype: core.TypeMarketProtected,
+	}
 }
 
 func (f *orderForm) update(m *model, msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -1077,19 +1242,61 @@ func (f *orderForm) update(m *model, msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		}
+	case "t":
+		// cycle order type MKT-PROT <-> LIMIT
+		if chainNav {
+			if f.otype == core.TypeMarketProtected {
+				f.otype = core.TypeLimit
+				// seed the price with today's protection price
+				if ltp, ok := f.app.Quotes.LTP(f.inst.Key()); ok && ltp > 0 {
+					f.priceInput.SetValue(fmt.Sprintf("%.2f", core.ProtectionPrice(ltp, f.side, f.inst.TickSize)))
+				}
+			} else {
+				f.otype = core.TypeMarketProtected
+				f.setFocus(0)
+			}
+			f.err = ""
+			return m, nil
+		}
 	case "tab":
-		if !f.brokerLocked {
+		// cycle focus among lots / price / SL (whichever exist)
+		if chainNav {
+			f.cycleFocus()
+			return m, nil
+		}
+	case "b":
+		// cycle broker
+		if chainNav && !f.brokerLocked {
 			if f.broker == core.BrokerKite {
 				f.broker = core.BrokerFyers
 			} else {
 				f.broker = core.BrokerKite
 			}
+			return m, nil
+		}
+	case "H":
+		// toggle hedge (defined-risk short)
+		if chainNav {
+			f.toggleHedge(m)
+			return m, nil
+		}
+	case "]":
+		// hedge leg one strike further OTM
+		if chainNav && f.hedge {
+			f.cycleHedge(m, 1)
+			return m, nil
+		}
+	case "[":
+		// hedge leg one strike closer OTM
+		if chainNav && f.hedge {
+			f.cycleHedge(m, -1)
+			return m, nil
 		}
 	case "enter":
 		if f.confirming {
 			return m, f.place(m)
 		}
-		f.buildConfirm()
+		return m, f.buildConfirm()
 	case "y":
 		if f.confirming {
 			return m, f.place(m)
@@ -1105,10 +1312,141 @@ func (f *orderForm) update(m *model, msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil // locked while the order round-trip runs
 		}
 		var cmd tea.Cmd
-		f.lotsInput, cmd = f.lotsInput.Update(msg)
+		switch f.focus {
+		case 1:
+			f.priceInput, cmd = f.priceInput.Update(msg)
+		case 2:
+			f.slInput, cmd = f.slInput.Update(msg)
+		default:
+			f.lotsInput, cmd = f.lotsInput.Update(msg)
+		}
 		return m, cmd
 	}
 	return m, nil
+}
+
+// setFocus moves keyboard focus to the given field (0=lots, 1=price,
+// 2=SL trigger), syncing the textinput cursor states.
+func (f *orderForm) setFocus(n int) {
+	f.focus = n
+	f.lotsInput.Blur()
+	f.priceInput.Blur()
+	f.slInput.Blur()
+	switch n {
+	case 1:
+		f.priceInput.Focus()
+	case 2:
+		f.slInput.Focus()
+	default:
+		f.lotsInput.Focus()
+	}
+}
+
+// cycleFocus advances focus to the next focusable field: lots -> price
+// (LIMIT only) -> SL trigger (SELL only) -> lots.
+func (f *orderForm) cycleFocus() {
+	switch f.focus {
+	case 0:
+		if f.otype == core.TypeLimit {
+			f.setFocus(1)
+		} else if f.side == core.SideSell {
+			f.setFocus(2)
+		}
+	case 1:
+		if f.side == core.SideSell {
+			f.setFocus(2)
+		} else {
+			f.setFocus(0)
+		}
+	case 2:
+		f.setFocus(0)
+	}
+}
+
+// toggleHedge flips the defined-risk short: a SELL plus a BUY of the
+// same option type at an OTM strike (a debit spread). BUY orders are
+// not hedgeable this way.
+func (f *orderForm) toggleHedge(m *model) {
+	if f.side != core.SideSell {
+		f.err = "hedge is for SELL orders (defined-risk short)"
+		return
+	}
+	f.hedge = !f.hedge
+	f.err = ""
+	if f.hedge {
+		f.hedgeDepth = 1
+		f.hedgeInst = m.findHedgeInstAt(f.inst, f.hedgeDepth)
+		if f.hedgeInst.Key() == "" {
+			f.hedge = false
+			f.err = "no OTM strike found to hedge against"
+		}
+	}
+}
+
+// cycleHedge moves the hedge leg a number of strikes further OTM
+// (positive = further, negative = closer). Recomputes the leg; clamps
+// at the nearest OTM.
+func (f *orderForm) cycleHedge(m *model, delta int) {
+	if !f.hedge {
+		return
+	}
+	f.hedgeDepth += delta
+	if f.hedgeDepth < 1 {
+		f.hedgeDepth = 1
+	}
+	inst := m.findHedgeInstAt(f.inst, f.hedgeDepth)
+	if inst.Key() == "" {
+		// ran past the last strike: hold at the previous depth
+		f.hedgeDepth -= delta
+		if f.hedgeDepth < 1 {
+			f.hedgeDepth = 1
+		}
+		return
+	}
+	f.hedgeInst = inst
+	f.err = ""
+}
+
+// findHedgeInstAt returns the hedge leg for a short option at the given
+// OTM depth (1 = nearest, 2 = next, …): BUY the same type at that many
+// strikes beyond the short's strike (CE -> higher, PE -> lower). Returns
+// the zero instrument when none exists at that depth.
+func (m *model) findHedgeInstAt(leg core.Instrument, depth int) core.Instrument {
+	if depth < 1 {
+		depth = 1
+	}
+	var target float64
+	if leg.OptionType == core.Call {
+		count := 0
+		for _, r := range m.chain {
+			if r.Strike > leg.Strike {
+				count++
+				if count == depth {
+					target = r.Strike
+					break
+				}
+			}
+		}
+	} else {
+		count := 0
+		for i := len(m.chain) - 1; i >= 0; i-- {
+			if m.chain[i].Strike < leg.Strike {
+				count++
+				if count == depth {
+					target = m.chain[i].Strike
+					break
+				}
+			}
+		}
+	}
+	if target == 0 {
+		return core.Instrument{}
+	}
+	inst := m.app.ChainInstrument(m.underlying(), m.expiryOffset, target, leg.OptionType)
+	if inst == nil {
+		return core.Instrument{}
+	}
+	return *inst
 }
 
 // retargetForm re-points the open order form at the instrument under
@@ -1133,29 +1471,103 @@ func (m *model) retargetForm() bool {
 	if inst.Key() != m.form.inst.Key() {
 		m.form.inst = *inst
 		m.form.err = ""
+		m.form.hedge = false // hedge leg invalidated by the instrument change
 	}
 	return true
 }
 
-func (f *orderForm) buildConfirm() {
+func (f *orderForm) buildConfirm() tea.Cmd {
 	lots, err := parseLots(f.lotsInput.Value())
 	if err != nil {
 		f.err = err.Error()
-		return
+		return nil
+	}
+	var price float64
+	if f.otype == core.TypeLimit {
+		price, err = parsePrice(f.priceInput.Value())
+		if err != nil {
+			f.err = err.Error()
+			return nil
+		}
+		if !core.IsValidPrice(price, f.inst.TickSize) {
+			f.err = fmt.Sprintf("price %.2f not on tick %.2f", price, f.inst.TickSize)
+			return nil
+		}
 	}
 	f.err = ""
 	plan := core.PlanSlices(f.inst, lots)
 	ltp, _ := f.app.Quotes.LTP(f.inst.Key())
-	price := f.inst.Key() + " MKT-PROT"
+	priceLabel := "MKT-PROT"
 	var est float64
-	if ltp > 0 {
+	if f.otype == core.TypeLimit {
+		priceLabel = fmt.Sprintf("LIMIT @%.2f", price)
+		est = float64(lots*f.inst.LotSize) * price
+	} else if ltp > 0 {
 		est = float64(lots*f.inst.LotSize) * core.ProtectionPrice(ltp, f.side, f.inst.TickSize)
 	}
 	f.confirmText = fmt.Sprintf(
 		"%s %d lots (%d) %s @ %s\nBroker: %s   Est value ₹%.0f   Slices: %d",
-		f.side, lots, lots*f.inst.LotSize, displayInstrument(f.inst), price,
+		f.side, lots, lots*f.inst.LotSize, displayInstrument(f.inst), priceLabel,
 		f.broker, est, len(plan.Quantities))
+	if f.hedge {
+		f.confirmText += fmt.Sprintf("\nHedge: BUY %d lots %s (defined-risk spread)",
+			lots, displayInstrument(f.hedgeInst))
+	}
+	if f.side == core.SideSell {
+		if ts := strings.TrimSpace(f.slInput.Value()); ts != "" {
+			f.confirmText += fmt.Sprintf("\nStop-loss: BUY %d lots %s @ trigger %s",
+				lots, displayInstrument(f.inst), ts)
+		}
+	}
 	f.confirming = true
+	f.marginText = ""
+	return f.marginCmd(lots, price)
+}
+
+// marginCmd fires an async margin-calculator query (Kite only); the
+// result lands as marginResultMsg and renders on the confirm screen.
+func (f *orderForm) marginCmd(lots int, price float64) tea.Cmd {
+	if f.app.Kite == nil || f.broker != core.BrokerKite {
+		return nil // no calculator: the confirm line simply omits margin
+	}
+	inst, side, broker, otype := f.inst, f.side, f.broker, f.otype
+	hedge, hedgeInst := f.hedge, f.hedgeInst
+	a := f.app
+	qty := lots * inst.LotSize
+	limitPrice := price
+	if otype == core.TypeMarketProtected {
+		if ltp, ok := a.Quotes.LTP(inst.Key()); ok && ltp > 0 {
+			limitPrice = core.ProtectionPrice(ltp, side, inst.TickSize)
+		} else {
+			limitPrice = 1 // calculator needs a nominal price
+		}
+	}
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		text := ""
+		if hedge {
+			hedgePrice := 1.0
+			if hltp, ok := a.Quotes.LTP(hedgeInst.Key()); ok && hltp > 0 {
+				hedgePrice = core.ProtectionPrice(hltp, core.SideBuy, hedgeInst.TickSize)
+			}
+			mg, err := a.BasketMargin(ctx, broker, []brokers.OrderRequest{
+				{Instrument: inst, Side: side, Qty: qty, OrderType: core.TypeLimit, LimitPrice: limitPrice},
+				{Instrument: hedgeInst, Side: core.SideBuy, Qty: qty, OrderType: core.TypeLimit, LimitPrice: hedgePrice},
+			})
+			if err == nil && mg.Total > 0 {
+				text = fmt.Sprintf("Combined margin ₹%.0f (span ₹%.0f + exposure ₹%.0f + premium ₹%.0f)",
+					mg.Total, mg.Span, mg.Exposure, mg.OptionPremium)
+			}
+		} else {
+			mg, err := a.OrderMargin(ctx, broker, inst, side, qty, limitPrice)
+			if err == nil && mg.Total > 0 {
+				text = fmt.Sprintf("Margin ₹%.0f (span ₹%.0f + exposure ₹%.0f + premium ₹%.0f)",
+					mg.Total, mg.Span, mg.Exposure, mg.OptionPremium)
+			}
+		}
+		return marginResultMsg{text: text}
+	}
 }
 
 func (f *orderForm) place(m *model) tea.Cmd {
@@ -1168,20 +1580,67 @@ func (f *orderForm) place(m *model) tea.Cmd {
 	if f.placing {
 		return nil
 	}
+	var price float64
+	if f.otype == core.TypeLimit {
+		price, err = parsePrice(f.priceInput.Value())
+		if err != nil {
+			f.err = err.Error()
+			return nil
+		}
+	}
+	// stop-loss trigger (SELL only): a separate protective BUY cover
+	// placed alongside the short. Empty = no SL.
+	var slTrigger float64
+	if f.side == core.SideSell {
+		ts := strings.TrimSpace(f.slInput.Value())
+		if ts != "" {
+			slTrigger, err = strconv.ParseFloat(ts, 64)
+			if err != nil || slTrigger <= 0 {
+				f.err = "SL trigger must be a positive price"
+				return nil
+			}
+			if !core.IsValidPrice(slTrigger, f.inst.TickSize) {
+				f.err = fmt.Sprintf("SL trigger %.2f not on tick %.2f", slTrigger, f.inst.TickSize)
+				return nil
+			}
+		}
+	}
 	f.placing = true
 	f.err = ""
 	f.app.RiskMu.Lock()
 	risk := f.app.Risk
 	f.app.RiskMu.Unlock()
-	inst, side, broker := f.inst, f.side, f.broker
+	inst, side, broker, otype := f.inst, f.side, f.broker, f.otype
+	hedge, hedgeInst := f.hedge, f.hedgeInst
 	userID := f.app.UserID
 	eng := f.app.Engine
 
 	// placement runs as a tea.Cmd off the UI loop; the result lands
 	// as placeResultMsg (handled in model.Update). The UI stays live.
+	// The protective hedge (BUY) leg is placed FIRST so the short is
+	// never exposed naked: if the short then fails, you hold a long,
+	// not an uncovered short.
 	return func() tea.Msg {
-		_, err := eng.PlaceIntent(ctxBG(), userID, inst, side, lots, core.TypeMarketProtected, 0, broker, risk)
-		return placeResultMsg{err: err}
+		if hedge {
+			_, err := eng.PlaceIntent(ctxBG(), userID, hedgeInst, core.SideBuy, lots, core.TypeMarketProtected, 0, broker, risk)
+			if err != nil {
+				return placeResultMsg{err: fmt.Errorf("hedge leg failed (main not placed): %w", err)}
+			}
+		}
+		_, err := eng.PlaceIntent(ctxBG(), userID, inst, side, lots, otype, price, broker, risk)
+		if err != nil {
+			if hedge {
+				return placeResultMsg{err: fmt.Errorf("hedge placed, main leg failed: %w", err)}
+			}
+			return placeResultMsg{err: err}
+		}
+		if slTrigger > 0 {
+			_, err := eng.PlaceStopLoss(ctxBG(), userID, inst, core.SideBuy, lots, slTrigger, broker, risk)
+			if err != nil {
+				return placeResultMsg{err: fmt.Errorf("short placed, stop-loss failed: %w", err)}
+			}
+		}
+		return placeResultMsg{err: nil}
 	}
 }
 
@@ -1195,6 +1654,9 @@ func (f *orderForm) view() string {
 	if f.confirming {
 		b.WriteString(titleStyle.Render("CONFIRM ORDER"))
 		b.WriteString("\n" + f.confirmText + "\n")
+		if f.marginText != "" {
+			b.WriteString(warnStyle.Render(f.marginText) + "\n")
+		}
 		b.WriteString(dimStyle.Render("(y) place   (n) back   (esc) cancel"))
 		if f.err != "" {
 			b.WriteString("\n" + redStyle.Render(f.err))
@@ -1203,12 +1665,44 @@ func (f *orderForm) view() string {
 	}
 	b.WriteString(titleStyle.Render(fmt.Sprintf("%s  %s  LTP %s", f.side, displayInstrument(f.inst), qLTPOf(f.app, f.inst))))
 	b.WriteString("\n")
-	b.WriteString(fmt.Sprintf("Lots: %s  (= %s units)\n", f.lotsInput.View(), dimStyle.Render("lots x lot size")))
-	b.WriteString(fmt.Sprintf("Type: MKT-PROT (default) · Broker: %s (Tab switch)\n", brokerColor(f.broker, string(f.broker))))
+	lotsLabel := "Lots"
+	if f.focus == 0 {
+		lotsLabel = "▶ Lots"
+	}
+	b.WriteString(fmt.Sprintf("%s: %s  (= %s units)\n", lotsLabel, f.lotsInput.View(), dimStyle.Render("lots x lot size")))
+	// price row (LIMIT only; MKT-PROT shows the type inline)
+	if f.otype == core.TypeLimit {
+		priceLabel := "Price"
+		if f.focus == 1 {
+			priceLabel = "▶ Price"
+		}
+		b.WriteString(fmt.Sprintf("%s: %s  (tick %.2f)\n", priceLabel, f.priceInput.View(), f.inst.TickSize))
+	}
+	// stop-loss row (SELL only): trigger defaults to +10%, editable.
+	// Leave empty to place without a protective cover.
+	if f.side == core.SideSell {
+		slLabel := "SL trigger"
+		if f.focus == 2 {
+			slLabel = "▶ SL trigger"
+		}
+		b.WriteString(fmt.Sprintf("%s: %s  (empty = no SL, +10%% default)\n", slLabel, f.slInput.View()))
+	}
+	typeTxt := fmt.Sprintf("Type: %s", f.otype)
+	if f.otype == core.TypeLimit {
+		typeTxt += " (t to switch)"
+	}
+	b.WriteString(fmt.Sprintf("%s · Broker: %s (b switch)\n", typeTxt, brokerColor(f.broker, string(f.broker))))
+	if f.hedge {
+		b.WriteString(warnStyle.Render(fmt.Sprintf("Hedge: BUY %s (%d× OTM)", displayInstrument(f.hedgeInst), f.hedgeDepth)))
+		b.WriteString("\n")
+		b.WriteString(dimStyle.Render("   [ ] cycle strike · H remove") + "\n")
+	} else if f.side == core.SideSell {
+		b.WriteString(dimStyle.Render("(H) add hedge — defined-risk short") + "\n")
+	}
 	if f.err != "" {
 		b.WriteString(redStyle.Render(f.err) + "\n")
 	}
-	b.WriteString(dimStyle.Render("(↑↓ strike · ←→ CE/PE while open) · (Tab) broker · (Enter) review · (Esc) cancel"))
+	b.WriteString(dimStyle.Render("(t) type · (Tab) focus · (b) broker · (↑↓←→ strike/CE-PE) · (Enter) review · (Esc) cancel"))
 	return b.String()
 }
 
@@ -1222,6 +1716,18 @@ func parseLots(s string) (int, error) {
 		return 0, fmt.Errorf("lots must be a positive number")
 	}
 	return lots, nil
+}
+
+func parsePrice(s string) (float64, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, fmt.Errorf("enter a limit price")
+	}
+	var p float64
+	if _, err := fmt.Sscanf(s, "%f", &p); err != nil || p <= 0 {
+		return 0, fmt.Errorf("price must be a positive number")
+	}
+	return p, nil
 }
 
 func qLTPOf(a *app.App, i core.Instrument) string {
@@ -1338,6 +1844,75 @@ func (lm *loginModal) view(m *model) string {
 	return b.String()
 }
 
+// bookEditModal edits a stop-loss order's trigger price from the book.
+type bookEditModal struct {
+	parentID string
+	inst     core.Instrument
+	side     core.Side
+	input    textinput.Model
+	err      string
+}
+
+func newBookEditModal(p core.Order) *bookEditModal {
+	ti := textinput.New()
+	ti.Placeholder = "new trigger"
+	if p.TriggerPrice > 0 {
+		ti.SetValue(fmt.Sprintf("%.2f", p.TriggerPrice))
+	}
+	ti.Focus()
+	return &bookEditModal{
+		parentID: p.ID,
+		inst:     p.Instrument,
+		side:     p.Side,
+		input:    ti,
+	}
+}
+
+func (bm *bookEditModal) update(m *model, msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		m.bookEdit = nil
+		return m, nil
+	case "enter":
+		v := strings.TrimSpace(bm.input.Value())
+		if v == "" {
+			bm.err = "enter a trigger price"
+			return m, nil
+		}
+		trig, err := strconv.ParseFloat(v, 64)
+		if err != nil || trig <= 0 {
+			bm.err = "trigger must be a positive price"
+			return m, nil
+		}
+		eng := m.app.Engine
+		userID := m.app.UserID
+		parentID := bm.parentID
+		return m, func() tea.Msg {
+			if err := eng.ModifyTrigger(ctxBG(), userID, parentID, trig); err != nil {
+				return bookActionResultMsg{err: err.Error()}
+			}
+			return bookActionResultMsg{info: fmt.Sprintf("stop-loss trigger updated to %.2f", trig)}
+		}
+	}
+	var cmd tea.Cmd
+	bm.input, cmd = bm.input.Update(msg)
+	return m, cmd
+}
+
+func (bm *bookEditModal) view(m *model) string {
+	var b strings.Builder
+	b.WriteString(titleStyle.Render("MODIFY STOP-LOSS"))
+	b.WriteString("\n" + dimStyle.Render(fmt.Sprintf("%s %s", bm.side, displayInstrument(bm.inst))))
+	b.WriteString("\n")
+	b.WriteString(fmt.Sprintf("Trigger: %s\n", bm.input.View()))
+	b.WriteString(dimStyle.Render("limit = trigger + protection band"))
+	if bm.err != "" {
+		b.WriteString("\n" + redStyle.Render(bm.err))
+	}
+	b.WriteString("\n" + dimStyle.Render("(Enter) update · (Esc) cancel"))
+	return b.String()
+}
+
 // collectAlerts derives NEW alerts from a snapshot. Dedup: each
 // condition fires once until it clears (re-arms when the condition
 // goes away) — not once per second.
@@ -1358,7 +1933,7 @@ func (m *model) collectAlerts(s app.Snapshot) []string {
 		}
 	}
 	if s.Market == core.MarketPreOpen {
-		out2 := "pre-open: order placement blocked until 09:15"
+		out2 := "pre-open: the broker may reject orders before 09:15"
 		if !m.alertActive["preopen"] {
 			m.alertActive["preopen"] = true
 			out = append(out, out2)

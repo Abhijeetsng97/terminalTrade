@@ -21,6 +21,7 @@ import (
 // Fyers v3 order type/side ints.
 const (
 	typeLimit = 1
+	typeSL    = 4 // stop-loss limit (trigger + limit)
 	sideBuy   = 1
 	sideSell  = -1
 )
@@ -201,13 +202,18 @@ func (a *Adapter) PlaceOrder(ctx context.Context, req brokers.OrderRequest) (str
 	if req.Side == core.SideSell {
 		side = sideSell
 	}
+	orderType := typeLimit
+	if req.OrderType == core.TypeStopLoss {
+		orderType = typeSL
+	}
 	resp, err := model.SingleOrderAction(fyersgosdk.OrderRequest{
 		Symbol:      req.Instrument.BrokerSymbols[core.BrokerFyers],
 		Qty:         req.Qty,
-		Type:        typeLimit,
+		Type:        orderType,
 		Side:        side,
 		ProductType: fyersgosdk.ProductMargin,
 		LimitPrice:  req.LimitPrice,
+		StopPrice:   req.TriggerPrice,
 		Validity:    "DAY",
 		OrderTag:    req.IdempotencyTag,
 	})

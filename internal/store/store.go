@@ -124,14 +124,15 @@ type parentDoc struct {
 	Side       string    `bson:"side"`
 	Lots       int       `bson:"lots"`
 	TotalQty   int       `bson:"total_qty"`
-	OrderType  string    `bson:"order_type"`
-	LimitPrice float64   `bson:"limit_price"`
-	Broker     string    `bson:"broker"`
-	State      string    `bson:"state"`
-	Reason     string    `bson:"reason"`
-	FilledQty  int       `bson:"filled_qty"`
-	Created    time.Time `bson:"created"`
-	Updated    time.Time `bson:"updated"`
+	OrderType    string    `bson:"order_type"`
+	LimitPrice   float64   `bson:"limit_price"`
+	TriggerPrice float64   `bson:"trigger_price"`
+	Broker       string    `bson:"broker"`
+	State        string    `bson:"state"`
+	Reason       string    `bson:"reason"`
+	FilledQty    int       `bson:"filled_qty"`
+	Created      time.Time `bson:"created"`
+	Updated      time.Time `bson:"updated"`
 }
 
 type childDoc struct {
@@ -143,6 +144,7 @@ type childDoc struct {
 	Qty            int       `bson:"qty"`
 	OrderType      string    `bson:"order_type"`
 	LimitPrice     float64   `bson:"limit_price"`
+	TriggerPrice   float64   `bson:"trigger_price"`
 	IdempotencyTag string    `bson:"idem_tag"`
 	Broker         string    `bson:"broker"`
 	BrokerOrderID  string    `bson:"broker_order_id,omitempty"`
@@ -162,8 +164,9 @@ func (s *Store) SaveParent(ctx context.Context, o core.Order) error {
 	doc := parentDoc{
 		ID: o.ID, UserID: o.UserID, Instrument: inst, Side: string(o.Side),
 		Lots: o.Lots, TotalQty: o.TotalQty, OrderType: string(o.OrderType),
-		LimitPrice: o.LimitPrice, Broker: string(o.Broker), State: string(o.State),
-		Reason: o.Reason, FilledQty: o.FilledQty, Created: o.Created, Updated: o.Updated,
+		LimitPrice: o.LimitPrice, TriggerPrice: o.TriggerPrice, Broker: string(o.Broker),
+		State: string(o.State), Reason: o.Reason, FilledQty: o.FilledQty,
+		Created: o.Created, Updated: o.Updated,
 	}
 	_, err = s.db.Collection(ColOrders).ReplaceOne(ctx,
 		bson.D{{Key: "id", Value: o.ID}},
@@ -180,7 +183,7 @@ func (s *Store) SaveChild(ctx context.Context, c core.ChildOrder) error {
 	doc := childDoc{
 		ID: c.ID, ParentID: c.ParentID, UserID: c.UserID, Instrument: inst,
 		Side: string(c.Side), Qty: c.Qty, OrderType: string(c.OrderType),
-		LimitPrice: c.LimitPrice, IdempotencyTag: c.IdempotencyTag,
+		LimitPrice: c.LimitPrice, TriggerPrice: c.TriggerPrice, IdempotencyTag: c.IdempotencyTag,
 		Broker: string(c.Broker), State: string(c.State), FilledQty: c.FilledQty,
 		Reason: c.Reason, Created: c.Created, Updated: c.Updated,
 	}
@@ -215,7 +218,8 @@ func (s *Store) ListParents(ctx context.Context, userID string, since time.Time)
 			ID: d.ID, UserID: d.UserID, Instrument: inst,
 			Side: core.Side(d.Side), Lots: d.Lots, TotalQty: d.TotalQty,
 			OrderType: core.OrderType(d.OrderType), LimitPrice: d.LimitPrice,
-			Broker: core.Broker(d.Broker), State: core.OrderState(d.State),
+			TriggerPrice: d.TriggerPrice,
+			Broker:       core.Broker(d.Broker), State: core.OrderState(d.State),
 			Reason: d.Reason, FilledQty: d.FilledQty, Created: d.Created, Updated: d.Updated,
 		})
 	}
@@ -240,7 +244,7 @@ func (s *Store) ListChildren(ctx context.Context, parentID string) ([]core.Child
 		out = append(out, core.ChildOrder{
 			ID: d.ID, ParentID: d.ParentID, UserID: d.UserID, Instrument: inst,
 			Side: core.Side(d.Side), Qty: d.Qty, OrderType: core.OrderType(d.OrderType),
-			LimitPrice: d.LimitPrice, IdempotencyTag: d.IdempotencyTag,
+			LimitPrice: d.LimitPrice, TriggerPrice: d.TriggerPrice, IdempotencyTag: d.IdempotencyTag,
 			Broker: core.Broker(d.Broker), BrokerOrderID: d.BrokerOrderID,
 			State: core.OrderState(d.State), FilledQty: d.FilledQty,
 			Reason: d.Reason, Created: d.Created, Updated: d.Updated,

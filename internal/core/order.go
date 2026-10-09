@@ -32,6 +32,10 @@ const (
 	TypeMarketProtected OrderType = "MKT-PROT"
 	// TypeLimit is an explicit limit order at a chosen price.
 	TypeLimit OrderType = "LIMIT"
+	// TypeStopLoss is a stop-loss limit (Kite "SL"): it carries a
+	// trigger price plus a limit above/below the trigger (protection
+	// band), used for the protective cover on a short option.
+	TypeStopLoss OrderType = "SL"
 )
 
 // OrderState is the state of a single order (parent or slice).
@@ -57,6 +61,9 @@ const (
 	// StateHalted means the parent was stopped: a margin rejection
 	// halted remaining slices (spec: margin rejection halts parent).
 	StateHalted OrderState = "HALTED"
+	// StateStale means the order's broker row no longer exists (a
+	// previous run's leftover that no live broker can confirm).
+	StateStale OrderState = "STALE"
 )
 
 // Order is a parent order: the trader's confirmed intent.
@@ -72,6 +79,8 @@ type Order struct {
 	OrderType OrderType
 	// LimitPrice is set for TypeLimit orders.
 	LimitPrice float64
+	// TriggerPrice is set for TypeStopLoss orders.
+	TriggerPrice float64
 	// Broker placement is routed to.
 	Broker   Broker
 	State    OrderState
@@ -95,6 +104,8 @@ type ChildOrder struct {
 	OrderType   OrderType
 	// LimitPrice of this slice (protection or explicit limit).
 	LimitPrice float64
+	// TriggerPrice for TypeStopLoss slices.
+	TriggerPrice float64
 	// IdempotencyTag is the client-generated unique tag sent to the
 	// broker so retries can never double-place (Kite tag / Fyers
 	// clientOrderId).
@@ -114,7 +125,7 @@ func AggregateState(children []ChildOrder) OrderState {
 	if len(children) == 0 {
 		return StateIntent
 	}
-	var open, filled, rejected, cancelled, partially int
+	var open, filled, rejected, cancelled, partially, stale int
 	for _, c := range children {
 		switch c.State {
 		case StateOpen, StatePlacing:
@@ -127,6 +138,8 @@ func AggregateState(children []ChildOrder) OrderState {
 			rejected++
 		case StateCancelled:
 			cancelled++
+		case StateStale:
+			stale++
 		}
 	}
 	// Margin halt: engine marks the parent halted explicitly.
@@ -139,6 +152,11 @@ func AggregateState(children []ChildOrder) OrderState {
 			return StatePartiallyFilled
 		}
 		return StateFilled
+	}
+	// every child stale and nothing filled/rejected/cancelled/open:
+	// the parent is a previous-run leftover.
+	if filled == 0 && stale > 0 && rejected == 0 && cancelled == 0 && open == 0 && partially == 0 {
+		return StateStale
 	}
 	if filled == 0 && rejected > 0 && open == 0 && partially == 0 {
 		if cancelled > 0 {

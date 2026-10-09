@@ -81,17 +81,23 @@ func (a *Adapter) SessionStatus(ctx context.Context) brokers.SessionStatus {
 }
 
 // PlaceOrder: always a LIMIT order (MKT-PROT is a limit at the
-// protection band; market orders are never sent).
+// protection band; market orders are never sent). Stop-loss orders
+// are Kite "SL" (limit with a trigger price).
 func (a *Adapter) PlaceOrder(ctx context.Context, req brokers.OrderRequest) (string, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	orderType := "LIMIT"
+	if req.OrderType == core.TypeStopLoss {
+		orderType = "SL"
+	}
 	resp, err := a.kc.PlaceOrder("regular", kiteconnect.OrderParams{
 		Exchange:        exchangeOf(req.Instrument),
 		Tradingsymbol:   req.Instrument.BrokerSymbols[core.BrokerKite],
 		TransactionType: string(req.Side),
-		OrderType:       "LIMIT",
+		OrderType:       orderType,
 		Quantity:        req.Qty,
 		Price:           req.LimitPrice,
+		TriggerPrice:    req.TriggerPrice,
 		Product:         "NRML",
 		Validity:        "DAY",
 		Tag:             req.IdempotencyTag,
@@ -113,6 +119,10 @@ func (a *Adapter) ModifyOrder(ctx context.Context, m brokers.ModifyRequest) erro
 	if m.NewPrice > 0 {
 		params.Price = m.NewPrice
 		params.OrderType = "LIMIT"
+	}
+	if m.NewTriggerPrice > 0 {
+		params.TriggerPrice = m.NewTriggerPrice
+		params.OrderType = "SL"
 	}
 	_, err := a.kc.ModifyOrder("regular", m.BrokerOrderID, params)
 	if err != nil {
@@ -163,7 +173,7 @@ func mapKiteStatus(s string) core.OrderState {
 	switch strings.ToUpper(s) {
 	case "COMPLETE":
 		return core.StateFilled
-	case "OPEN", "AMO REQ RECEIVED":
+	case "OPEN", "AMO REQ RECEIVED", "TRIGGER PENDING":
 		return core.StateOpen
 	case "REJECTED":
 		return core.StateRejected
@@ -383,6 +393,7 @@ var freezeFallback = map[string]int{
 	"FINNIFTY":   3240,
 	"MIDCPNIFTY": 5760,
 	"NIFTYNXT50": 1125,
+	"SENSEX":     250, // SENSEX options: 10/unit lot; freeze 250 units (verify vs NSE circular)
 }
 
 func NightlyFreezeFill(insts []core.Instrument) []core.Instrument {
@@ -398,6 +409,73 @@ func NightlyFreezeFill(insts []core.Instrument) []core.Instrument {
 func exchangeOf(i core.Instrument) string {
 	// All v1 tradables are NSE F&O.
 	return "NFO"
+}
+
+// OrderMargin queries Kite's margin calculator for a single leg.
+func (a *Adapter) OrderMargin(ctx context.Context, req brokers.OrderRequest) (brokers.Margin, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	rows, err := a.kc.GetOrderMargins(kiteconnect.GetMarginParams{
+		OrderParams: []kiteconnect.OrderMarginParam{marginParam(req)},
+	})
+	if err != nil {
+		return brokers.Margin{}, classifyKite(err)
+	}
+	if len(rows) == 0 {
+		return brokers.Margin{}, nil
+	}
+	r := rows[0]
+	return brokers.Margin{
+		Total:         r.Total,
+		Span:          r.SPAN,
+		Exposure:      r.Exposure,
+		OptionPremium: r.OptionPremium,
+	}, nil
+}
+
+// BasketMargin queries Kite's basket margin calculator for a spread
+// (e.g. a short + hedge long) — the combined net margin, which shows
+// the benefit of the long leg.
+func (a *Adapter) BasketMargin(ctx context.Context, reqs []brokers.OrderRequest) (brokers.Margin, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	params := make([]kiteconnect.OrderMarginParam, 0, len(reqs))
+	for _, r := range reqs {
+		params = append(params, marginParam(r))
+	}
+	bm, err := a.kc.GetBasketMargins(kiteconnect.GetBasketParams{OrderParams: params})
+	if err != nil {
+		return brokers.Margin{}, classifyKite(err)
+	}
+	return brokers.Margin{
+		Total:         bm.Final.Total,
+		Span:          bm.Final.SPAN,
+		Exposure:      bm.Final.Exposure,
+		OptionPremium: bm.Final.OptionPremium,
+	}, nil
+}
+
+// marginParam maps a canonical order request to Kite's margin
+// calculator param (LIMIT orders always; price defaults to the limit).
+func marginParam(req brokers.OrderRequest) kiteconnect.OrderMarginParam {
+	price := req.LimitPrice
+	ot := "LIMIT"
+	if price <= 0 {
+		// no price yet: market-protected — use a LIMIT at a nominal
+		// price; the calculator needs *some* price to produce a span.
+		ot = "LIMIT"
+		price = 1
+	}
+	return kiteconnect.OrderMarginParam{
+		Exchange:        exchangeOf(req.Instrument),
+		Tradingsymbol:   req.Instrument.BrokerSymbols[core.BrokerKite],
+		TransactionType: string(req.Side),
+		Variety:         "regular",
+		Product:         "NRML",
+		OrderType:       ot,
+		Quantity:        float64(req.Qty),
+		Price:           price,
+	}
 }
 
 // classifyKite separates broker rejections from transport errors.

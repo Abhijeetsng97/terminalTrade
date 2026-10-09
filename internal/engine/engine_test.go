@@ -243,19 +243,21 @@ func TestMarginRejectionHaltsRemainingSlices(t *testing.T) {
 }
 
 // Market-hours guard: closed market refuses before any broker call.
-func TestMarketClosedBlocksOrder(t *testing.T) {
+// The engine no longer gates placement on market hours: the broker is
+// the authority and surfaces its own rejection (see spec change). A
+// closed clock must NOT refuse the order client-side.
+func TestMarketClosedDoesNotBlockOrder(t *testing.T) {
 	a := sim.New()
 	e, _ := newTestEngine(simBroker{a})
-	// close the market
 	closed := time.Date(2026, 10, 7, 16, 0, 0, 0, core.LocalIST())
 	e.SetClockForTest(func() time.Time { return closed })
 
 	_, err := e.PlaceIntent(context.Background(), "u", testInstrument(), core.SideBuy, 1, core.TypeMarketProtected, 0, "SIM", riskCfg())
-	if err == nil {
-		t.Fatal("closed market must refuse")
+	if err != nil {
+		t.Fatalf("engine must not gate on market hours (broker is authority): %v", err)
 	}
-	if len(a.Placed()) != 0 {
-		t.Error("nothing may reach the broker when closed")
+	if len(a.Placed()) != 1 {
+		t.Errorf("order should reach the broker; placed = %d", len(a.Placed()))
 	}
 }
 
@@ -322,6 +324,50 @@ func TestReconcileConverges(t *testing.T) {
 	}
 }
 
+// A previous run's leftover (OPEN child whose broker row no longer
+// exists) must converge to STALE — the book showed OPEN forever on
+// these.
+func TestReconcileMarksStaleLeftover(t *testing.T) {
+	a := sim.New()
+	e, st := newTestEngine(simBroker{a})
+
+	inst := testInstrument()
+	now := e.clock() // 2026-10-07 10:00 IST
+	old := now.Add(-6 * time.Minute)
+
+	parent := core.Order{
+		ID: "p1", UserID: "u", Instrument: inst, Side: core.SideBuy,
+		Lots: 1, TotalQty: inst.LotSize, OrderType: core.TypeMarketProtected,
+		Broker: core.Broker("SIM"), State: core.StateOpen, Created: old, Updated: old,
+	}
+	if err := st.SaveParent(context.Background(), parent); err != nil {
+		t.Fatal(err)
+	}
+	child := core.ChildOrder{
+		ID: "c1", ParentID: "p1", UserID: "u", Instrument: inst, Side: core.SideBuy,
+		Qty: inst.LotSize, OrderType: core.TypeMarketProtected,
+		Broker: core.Broker("SIM"), BrokerOrderID: "gone-from-broker",
+		State: core.StateOpen, Created: old, Updated: old,
+	}
+	if err := st.SaveChild(context.Background(), child); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := e.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	kids, _ := st.ListChildren(context.Background(), "p1")
+	if len(kids) != 1 || kids[0].State != core.StateStale {
+		t.Fatalf("stale child state = %v, want STALE", kids)
+	}
+	ps, _ := st.ListParents(context.Background(), "", time.Time{})
+	for i := range ps {
+		if ps[i].ID == "p1" && ps[i].State != core.StateStale {
+			t.Errorf("parent state %s, want STALE", ps[i].State)
+		}
+	}
+}
+
 // simBroker adapts the sim adapter to the SIM broker name used in tests.
 type simBroker struct{ *sim.Adapter }
 
@@ -332,4 +378,56 @@ type rejectingAdapter struct{ simBroker }
 
 func (r rejectingAdapter) PlaceOrder(ctx context.Context, req brokers.OrderRequest) (string, error) {
 	return "", &brokers.AdapterError{Kind: brokers.ErrRejection, Message: "exchange rejected: invalid price"}
+}
+
+// A stop-loss order carries its trigger and a limit derived from the
+// trigger via the protection band (buy cover: trigger + band).
+func TestPlaceStopLoss(t *testing.T) {
+	a := sim.New()
+	e, st := newTestEngine(simBroker{a})
+
+	parent, err := e.PlaceStopLoss(context.Background(), "u", testInstrument(), core.SideBuy, 10, 22.0, "SIM", riskCfg())
+	if err != nil {
+		t.Fatalf("place SL: %v", err)
+	}
+	req := a.Placed()[0]
+	if req.OrderType != core.TypeStopLoss {
+		t.Errorf("order type: got %s", req.OrderType)
+	}
+	if req.TriggerPrice != 22.0 {
+		t.Errorf("trigger: got %.2f want 22.00", req.TriggerPrice)
+	}
+	if req.LimitPrice <= 22.0 {
+		t.Errorf("SL limit %.2f must exceed trigger 22.00 (buy cover)", req.LimitPrice)
+	}
+	if parent.TriggerPrice != 22.0 || parent.OrderType != core.TypeStopLoss {
+		t.Errorf("parent must persist trigger/type")
+	}
+	// stored parent round-trips the trigger
+	kids, _ := st.ListChildren(context.Background(), parent.ID)
+	if len(kids) == 0 || kids[0].TriggerPrice != 22.0 {
+		t.Errorf("child trigger not persisted")
+	}
+}
+
+// ModifyTrigger updates every open slice's trigger and recomputes the
+// limit.
+func TestModifyTrigger(t *testing.T) {
+	a := sim.New()
+	e, st := newTestEngine(simBroker{a})
+
+	parent, err := e.PlaceStopLoss(context.Background(), "u", testInstrument(), core.SideBuy, 10, 22.0, "SIM", riskCfg())
+	if err != nil {
+		t.Fatalf("place SL: %v", err)
+	}
+	if err := e.ModifyTrigger(context.Background(), "u", parent.ID, 24.0); err != nil {
+		t.Fatalf("modify trigger: %v", err)
+	}
+	kids, _ := st.ListChildren(context.Background(), parent.ID)
+	if kids[0].TriggerPrice != 24.0 {
+		t.Errorf("child trigger after modify: got %.2f want 24.00", kids[0].TriggerPrice)
+	}
+	if kids[0].LimitPrice <= 24.0 {
+		t.Errorf("modified limit must exceed new trigger 24.00")
+	}
 }

@@ -101,9 +101,10 @@ func (e *Engine) ValidateIntent(ctx context.Context, inst core.Instrument, side 
 	if symbol, ok := inst.BrokerSymbols[broker]; !ok || symbol == "" {
 		return core.SlicePlan{}, fmt.Errorf("%s does not list %s", broker, inst.Key())
 	}
-	if !e.hours.CanPlace(e.clock()) {
-		return core.SlicePlan{}, fmt.Errorf("market closed: orders only 09:15-15:30 IST on trading days")
-	}
+	// No client-side market-hours gate: the broker is the authority.
+	// Placing outside hours surfaces as a broker rejection (the trader
+	// sees the real reason, not a synthetic "market closed" message).
+	// Market-hours still gates the quote poller (no wasted calls).
 	if risk.MaxLotsPerOrder > 0 && lots > risk.MaxLotsPerOrder {
 		return core.SlicePlan{}, fmt.Errorf("order of %d lots exceeds per-order cap %d", lots, risk.MaxLotsPerOrder)
 	}
@@ -127,6 +128,19 @@ func (e *Engine) ValidateIntent(ctx context.Context, inst core.Instrument, side 
 // transport failures retried with fresh tags, margin rejections
 // halt the remaining slices.
 func (e *Engine) PlaceIntent(ctx context.Context, userID string, inst core.Instrument, side core.Side, lots int, ot core.OrderType, limitPrice float64, broker core.Broker, risk RiskConfig) (core.Order, error) {
+	return e.place(ctx, userID, inst, side, lots, ot, limitPrice, 0, broker, risk)
+}
+
+// PlaceStopLoss places a stop-loss limit (Kite "SL"): a trigger price
+// plus a limit derived from it via the protection band. Used for the
+// protective cover on a short option.
+func (e *Engine) PlaceStopLoss(ctx context.Context, userID string, inst core.Instrument, side core.Side, lots int, triggerPrice float64, broker core.Broker, risk RiskConfig) (core.Order, error) {
+	return e.place(ctx, userID, inst, side, lots, core.TypeStopLoss, 0, triggerPrice, broker, risk)
+}
+
+// place is the shared placement path. triggerPrice is only set for
+// stop-loss orders.
+func (e *Engine) place(ctx context.Context, userID string, inst core.Instrument, side core.Side, lots int, ot core.OrderType, limitPrice, triggerPrice float64, broker core.Broker, risk RiskConfig) (core.Order, error) {
 	plan, err := e.ValidateIntent(ctx, inst, side, lots, ot, limitPrice, broker, risk)
 	if err != nil {
 		return core.Order{}, err
@@ -141,21 +155,33 @@ func (e *Engine) PlaceIntent(ctx context.Context, userID string, inst core.Instr
 		}
 		price = core.ProtectionPrice(ltp, side, inst.TickSize)
 	}
+	// stop-loss: validate the trigger and derive the limit above/below
+	// it with the same protection band (SL limit = trigger ± band).
+	if ot == core.TypeStopLoss {
+		if triggerPrice <= 0 {
+			return core.Order{}, fmt.Errorf("stop-loss requires a trigger price")
+		}
+		if !core.IsValidPrice(triggerPrice, inst.TickSize) {
+			return core.Order{}, fmt.Errorf("trigger %.2f not on tick %.2f", triggerPrice, inst.TickSize)
+		}
+		price = core.ProtectionPrice(triggerPrice, side, inst.TickSize)
+	}
 
 	now := e.clock()
 	parent := core.Order{
-		ID:         newID("ord"),
-		UserID:     userID,
-		Instrument: inst,
-		Side:       side,
-		Lots:       lots,
-		TotalQty:   lots * inst.LotSize,
-		OrderType:  ot,
-		LimitPrice: price,
-		Broker:     broker,
-		State:      core.StatePlacing,
-		Created:    now,
-		Updated:    now,
+		ID:           newID("ord"),
+		UserID:       userID,
+		Instrument:   inst,
+		Side:         side,
+		Lots:         lots,
+		TotalQty:     lots * inst.LotSize,
+		OrderType:    ot,
+		LimitPrice:   price,
+		TriggerPrice: triggerPrice,
+		Broker:       broker,
+		State:        core.StatePlacing,
+		Created:      now,
+		Updated:      now,
 	}
 	if err := e.store.SaveParent(ctx, parent); err != nil {
 		return core.Order{}, err
@@ -168,18 +194,19 @@ func (e *Engine) PlaceIntent(ctx context.Context, userID string, inst core.Instr
 	children := make([]core.ChildOrder, 0, len(plan.Quantities))
 	for _, qty := range plan.Quantities {
 		child := core.ChildOrder{
-			ID:        newID("sli"),
-			ParentID:  parent.ID,
-			UserID:    userID,
-			Instrument: inst,
-			Side:      side,
-			Qty:       qty,
-			OrderType: ot,
-			LimitPrice: price,
-			Broker:    broker,
-			State:     core.StatePlacing,
-			Created:   now,
-			Updated:   now,
+			ID:           newID("sli"),
+			ParentID:     parent.ID,
+			UserID:       userID,
+			Instrument:   inst,
+			Side:         side,
+			Qty:          qty,
+			OrderType:    ot,
+			LimitPrice:   price,
+			TriggerPrice: triggerPrice,
+			Broker:       broker,
+			State:        core.StatePlacing,
+			Created:      now,
+			Updated:      now,
 		}
 		child.IdempotencyTag = newID("tag")
 		if err := e.store.SaveChild(ctx, child); err != nil {
@@ -257,6 +284,7 @@ func (e *Engine) placeWithRetry(ctx context.Context, child core.ChildOrder) (str
 			Qty:              child.Qty,
 			OrderType:        child.OrderType,
 			LimitPrice:       child.LimitPrice,
+			TriggerPrice:     child.TriggerPrice,
 			IdempotencyTag:   child.IdempotencyTag,
 		})
 		if err == nil {
@@ -323,6 +351,65 @@ func (e *Engine) ModifyChild(ctx context.Context, userID, childID string, newPri
 	child.Updated = e.clock()
 	_ = e.store.SaveChild(ctx, child)
 	e.audit(ctx, userID, "order-modified", childID, fmt.Sprintf("price=%.2f qty=%d", newPrice, newQty))
+	return nil
+}
+
+// ModifyTrigger changes the trigger (and recomputes the limit) of every
+// open slice under a parent stop-loss order.
+func (e *Engine) ModifyTrigger(ctx context.Context, userID, parentID string, newTrigger float64) error {
+	kids, err := e.store.ListChildren(ctx, parentID)
+	if err != nil {
+		return err
+	}
+	if len(kids) == 0 {
+		return fmt.Errorf("no slices to modify")
+	}
+	if kids[0].OrderType != core.TypeStopLoss {
+		return fmt.Errorf("order is not a stop-loss")
+	}
+	if newTrigger <= 0 || !core.IsValidPrice(newTrigger, kids[0].Instrument.TickSize) {
+		return fmt.Errorf("trigger %.2f not on tick %.2f", newTrigger, kids[0].Instrument.TickSize)
+	}
+	newPrice := core.ProtectionPrice(newTrigger, kids[0].Side, kids[0].Instrument.TickSize)
+	modified := 0
+	for _, k := range kids {
+		if k.State != core.StateOpen && k.State != core.StatePartiallyFilled {
+			continue
+		}
+		adapter := e.adapters[k.Broker]
+		if adapter == nil {
+			continue
+		}
+		if err := adapter.ModifyOrder(ctx, brokers.ModifyRequest{
+			BrokerOrderID:   k.BrokerOrderID,
+			NewPrice:        newPrice,
+			NewTriggerPrice: newTrigger,
+		}); err != nil {
+			return err
+		}
+		k.TriggerPrice = newTrigger
+		k.LimitPrice = newPrice
+		k.Updated = e.clock()
+		_ = e.store.SaveChild(ctx, k)
+		modified++
+	}
+	if modified == 0 {
+		return fmt.Errorf("no open slices to modify")
+	}
+	// reflect on the parent so the book shows the new trigger immediately
+	parents, err := e.store.ListParents(ctx, "", e.clock().Add(-24*time.Hour))
+	if err == nil {
+		for _, p := range parents {
+			if p.ID == parentID {
+				p.TriggerPrice = newTrigger
+				p.LimitPrice = newPrice
+				p.Updated = e.clock()
+				_ = e.store.SaveParent(ctx, p)
+				break
+			}
+		}
+	}
+	e.audit(ctx, userID, "order-modified", parentID, fmt.Sprintf("trigger=%.2f limit=%.2f", newTrigger, newPrice))
 	return nil
 }
 
@@ -396,19 +483,26 @@ func (e *Engine) reaggregateParents(ctx context.Context) int {
 		for _, k := range kids {
 			newFilled += k.FilledQty
 		}
-		if newState != p.State || newFilled != p.FilledQty {
-			p.State = newState
-			p.FilledQty = newFilled
-			p.Updated = e.clock()
-			// rejected parents must show why in the book
-			if newState == core.StateRejected && p.Reason == "" {
-				for _, k := range kids {
-					if k.State == core.StateRejected && k.Reason != "" {
-						p.Reason = k.Reason
-						break
-					}
+		// backfill the rejection reason even when the state didn't
+		// change (rows rejected before the reason plumbing landed
+		// must still show why in the book)
+		newReason := p.Reason
+		if (newState == core.StateRejected || newState == core.StateStale) && newReason == "" {
+			for _, k := range kids {
+				if k.Reason != "" {
+					newReason = k.Reason
+					break
 				}
 			}
+			if newState == core.StateStale && newReason == "" {
+				newReason = "not in broker book (previous run)"
+			}
+		}
+		if newState != p.State || newFilled != p.FilledQty || newReason != p.Reason {
+			p.State = newState
+			p.FilledQty = newFilled
+			p.Reason = newReason
+			p.Updated = e.clock()
 			_ = e.store.SaveParent(ctx, p)
 			fixed++
 		}
@@ -416,17 +510,23 @@ func (e *Engine) reaggregateParents(ctx context.Context) int {
 	return fixed
 }
 
-// reconcileBroker is store-implementation specific; the engine calls
-// back into store to find children by tag. Simplified: matching by
-// BrokerOrderID set on child rows.
+// reconcileBroker converges children for one broker: children with a
+// broker order id are matched to the live book; children still OPEN
+// (or PLACING) whose broker row is gone after a grace window are
+// marked STALE — a previous run's leftover that no live broker can
+// ever confirm.
 func (e *Engine) reconcileBroker(ctx context.Context, b core.Broker, rows []brokers.BrokerOrder) int {
-	if len(rows) == 0 {
-		return 0
-	}
 	parents, err := e.store.ListParents(ctx, "", e.clock().Add(-24*time.Hour))
 	if err != nil {
 		return 0
 	}
+	// live broker order ids this broker reports today
+	live := make(map[string]brokers.BrokerOrder, len(rows))
+	for _, r := range rows {
+		live[r.BrokerOrderID] = r
+	}
+	staleBefore := e.clock().Add(-5 * time.Minute)
+
 	fixed := 0
 	for _, p := range parents {
 		if p.Broker != b {
@@ -437,16 +537,25 @@ func (e *Engine) reconcileBroker(ctx context.Context, b core.Broker, rows []brok
 			continue
 		}
 		for i, k := range kids {
-			for _, r := range rows {
-				if k.BrokerOrderID != "" && k.BrokerOrderID == r.BrokerOrderID {
-					if k.State != mapBrokerStatus(r.Status) || k.FilledQty != r.FilledQty {
-						kids[i].State = mapBrokerStatus(r.Status)
-						kids[i].FilledQty = r.FilledQty
-						kids[i].Updated = e.clock()
-						_ = e.store.SaveChild(ctx, kids[i])
-						fixed++
-					}
+			if r, ok := live[k.BrokerOrderID]; ok && k.BrokerOrderID != "" {
+				// matched: broker wins
+				if k.State != mapBrokerStatus(r.Status) || k.FilledQty != r.FilledQty {
+					kids[i].State = mapBrokerStatus(r.Status)
+					kids[i].FilledQty = r.FilledQty
+					kids[i].Updated = e.clock()
+					_ = e.store.SaveChild(ctx, kids[i])
+					fixed++
 				}
+				continue
+			}
+			// no live row: an OPEN/PLACING child older than the grace
+			// window is a stale leftover.
+			if (k.State == core.StateOpen || k.State == core.StatePlacing) && k.Created.Before(staleBefore) {
+				kids[i].State = core.StateStale
+				kids[i].Reason = "not in broker book (previous run)"
+				kids[i].Updated = e.clock()
+				_ = e.store.SaveChild(ctx, kids[i])
+				fixed++
 			}
 		}
 	}

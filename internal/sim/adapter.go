@@ -143,6 +143,9 @@ func (a *Adapter) ModifyOrder(ctx context.Context, req brokers.ModifyRequest) er
 		if req.NewQty > 0 {
 			o.req.Qty = req.NewQty
 		}
+		if req.NewTriggerPrice > 0 {
+			o.req.TriggerPrice = req.NewTriggerPrice
+		}
 		return nil
 }
 	return &brokers.AdapterError{Kind: brokers.ErrRejection, Message: "order not modifiable"}

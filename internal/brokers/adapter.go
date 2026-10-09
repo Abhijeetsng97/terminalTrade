@@ -21,6 +21,8 @@ type OrderRequest struct {
 	// LimitPrice for MKT-PROT and LIMIT (both are limit orders at
 	// the broker; market orders are never sent).
 	LimitPrice  float64
+	// TriggerPrice for TypeStopLoss orders.
+	TriggerPrice float64
 	// IdempotencyTag: client-generated unique tag per placement
 	// attempt (fresh tag on every retry).
 	IdempotencyTag string
@@ -33,6 +35,8 @@ type ModifyRequest struct {
 	NewQty int
 	// NewPrice; 0 = unchanged.
 	NewPrice float64
+	// NewTriggerPrice for a stop-loss order; 0 = unchanged.
+	NewTriggerPrice float64
 }
 
 // SessionStatus describes a broker session.
@@ -182,4 +186,14 @@ type BrokerTrade struct {
 	Qty            int
 	Price          float64
 	ExchangeTime   time.Time
+}
+
+// Margin is the broker-calculated margin requirement for an order
+// (or a basket of legs), used by the confirm screen. Zero-valued when
+// the broker has no margin-calculator API.
+type Margin struct {
+	Total         float64
+	Span          float64
+	Exposure      float64
+	OptionPremium float64
 }
